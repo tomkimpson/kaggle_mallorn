@@ -1,0 +1,45 @@
+# Data (download from Kaggle)
+/data/
+
+# Virtual environment
+venv/
+
+# Model checkpoints
+checkpoints/
+
+# SLURM outputs
+slurm/outputs/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Submissions
+submission*.csv
+
+# Logs
+*.log
+
+# Claude Code
+.claude/

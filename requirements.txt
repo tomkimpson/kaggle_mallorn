@@ -1,0 +1,22 @@
+# Core dependencies
+numpy>=1.24.0
+pandas>=2.0.0
+scipy>=1.10.0
+
+# PyTorch (GPU-enabled)
+torch>=2.0.0
+
+# Astronomy-specific
+extinction>=0.4.6
+
+# Machine Learning
+scikit-learn>=1.2.0
+
+# Visualization (optional)
+matplotlib>=3.7.0
+
+# Progress bars
+tqdm>=4.65.0
+
+# Configuration
+pyyaml>=6.0
