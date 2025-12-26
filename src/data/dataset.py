@@ -85,11 +85,11 @@ class LightCurveDataset(Dataset):
 
         Returns:
             Dictionary containing:
-            - 'sequences': Tensor of shape (6, max_seq_len, 3) for all bands
-                          Last dim is [flux, flux_err, time_delta]
+            - 'sequences': Tensor of shape (6, max_seq_len, 6) for all bands
+                          Last dim is [flux, flux_err, time_delta, snr, log_flux, cumulative_time]
             - 'masks': Tensor of shape (6, max_seq_len) indicating valid positions
             - 'lengths': Tensor of shape (6,) with actual sequence lengths
-            - 'metadata': Tensor of shape (2,) with [Z, EBV] if include_metadata
+            - 'metadata': Tensor of shape (2,) with [Z_norm, EBV_norm] if include_metadata
             - 'target': Tensor of shape (1,) with label if not is_test
             - 'object_id': String object identifier
         """
@@ -161,9 +161,14 @@ class LightCurveDataset(Dataset):
             'object_id': object_id,
         }
 
-        # Add metadata features
+        # Add metadata features (normalized)
         if self.include_metadata:
-            metadata = np.array([z, ebv], dtype=np.float32)
+            # Normalize using training set statistics
+            # Z: mean=0.6707, std=0.5393
+            # EBV: mean=0.0555, std=0.0613
+            z_norm = (z - 0.6707) / 0.5393
+            ebv_norm = (ebv - 0.0555) / 0.0613
+            metadata = np.array([z_norm, ebv_norm], dtype=np.float32)
             result['metadata'] = torch.from_numpy(metadata)
 
         # Add target label
@@ -206,17 +211,27 @@ class LightCurveDataset(Dataset):
 
         Returns:
             Tuple of (sequence, mask, original_length)
+            sequence has shape (max_seq_len, 6) with features:
+            [flux, flux_err, time_delta, snr, log_flux, cumulative_time]
         """
         n = len(time)
-        seq = np.zeros((self.max_seq_len, 3), dtype=np.float32)
+        seq = np.zeros((self.max_seq_len, 6), dtype=np.float32)
         mask = np.zeros(self.max_seq_len, dtype=np.float32)
 
         if n == 0:
             return seq, mask, 0
 
-        # Truncate if too long (sample uniformly)
+        # Truncate if too long - use importance-weighted sampling around peak
         if n > self.max_seq_len:
-            indices = np.linspace(0, n - 1, self.max_seq_len, dtype=int)
+            # Find peak and sample more densely around it
+            peak_idx = np.argmax(np.abs(flux))
+            weights = np.ones(n)
+            sigma = n / 4
+            weights += 2.0 * np.exp(-0.5 * ((np.arange(n) - peak_idx) / sigma) ** 2)
+            if peak_idx > 0:
+                weights[:peak_idx] *= 1.5  # Weight rise phase more heavily
+            weights /= weights.sum()
+            indices = np.sort(np.random.choice(n, size=self.max_seq_len, replace=False, p=weights))
             time = time[indices]
             flux = flux[indices]
             flux_err = flux_err[indices]
@@ -227,10 +242,18 @@ class LightCurveDataset(Dataset):
         if len(time) > 1:
             time_delta[1:] = np.diff(time)
 
-        # Fill sequence
+        # Compute additional features
+        snr = flux / (flux_err + 1e-8)
+        log_flux = np.sign(flux) * np.log1p(np.abs(flux))
+        cumulative_time = np.cumsum(time_delta)
+
+        # Fill sequence with 6 features
         seq[:n, 0] = flux
         seq[:n, 1] = flux_err
         seq[:n, 2] = time_delta
+        seq[:n, 3] = snr
+        seq[:n, 4] = log_flux
+        seq[:n, 5] = cumulative_time
         mask[:n] = 1.0
 
         return seq, mask, n

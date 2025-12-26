@@ -13,7 +13,7 @@
 mkdir -p slurm/outputs
 
 # Navigate to project directory
-cd /Users/tkimpson/projects/kaggle_mallorn
+cd /fred/oz022/tkimpson/kaggle_mallorn
 
 # Activate virtual environment
 source venv/bin/activate
@@ -71,6 +71,57 @@ time python3 scripts/train.py \
     --checkpoint_dir checkpoints/transformer
 
 echo "============================================"
+echo "Transformer training complete. Starting LightGBM..."
+echo "============================================"
+
+# Run LightGBM with Optuna hyperparameter tuning
+time python3 scripts/train_gbm.py \
+    --n_folds 5 \
+    --checkpoint_dir checkpoints/lgbm \
+    --optuna \
+    --optuna_trials 50 \
+    --output submission_lgbm.csv
+
+echo "============================================"
+echo "LightGBM training complete. Building stacking ensemble..."
+echo "============================================"
+
+# Train stacking ensemble (combines CNN, Transformer, LightGBM)
+time python3 scripts/ensemble_stack.py \
+    --train \
+    --cnn_dir checkpoints/cnn \
+    --transformer_dir checkpoints/transformer \
+    --lgbm_dir checkpoints/lgbm \
+    --output_dir checkpoints/ensemble \
+    --n_folds 5 \
+    --batch_size 64 \
+    --device cuda
+
+echo "============================================"
+echo "Stacking ensemble trained. Generating final predictions..."
+echo "============================================"
+
+# Generate final submission with stacking ensemble
+time python3 scripts/ensemble_stack.py \
+    --predict \
+    --cnn_dir checkpoints/cnn \
+    --transformer_dir checkpoints/transformer \
+    --lgbm_dir checkpoints/lgbm \
+    --output_dir checkpoints/ensemble \
+    --submission submission_ensemble.csv \
+    --n_folds 5 \
+    --batch_size 64 \
+    --device cuda
+
+echo "============================================"
 echo "All training complete!"
 echo "End time: $(date)"
 echo "============================================"
+
+# Print summary of submissions
+echo ""
+echo "Generated submissions:"
+ls -la submission*.csv
+echo ""
+echo "Model checkpoints:"
+du -sh checkpoints/*/

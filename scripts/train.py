@@ -94,7 +94,7 @@ def create_model(args, device: torch.device) -> nn.Module:
     """Create the model based on arguments."""
     if args.model == 'cnn':
         model = LightCurveCNN(
-            in_features=3,
+            in_features=6,
             hidden_channels=64,
             band_embedding_dim=128,
             metadata_dim=2,
@@ -104,7 +104,7 @@ def create_model(args, device: torch.device) -> nn.Module:
         )
     elif args.model == 'cnn_attn':
         model = LightCurveCNNWithAttention(
-            in_features=3,
+            in_features=6,
             hidden_channels=64,
             band_embedding_dim=128,
             metadata_dim=2,
@@ -114,7 +114,7 @@ def create_model(args, device: torch.device) -> nn.Module:
         )
     elif args.model == 'transformer':
         model = LightCurveTransformer(
-            in_features=3,
+            in_features=6,
             d_model=64,
             n_heads=4,
             n_layers=2,

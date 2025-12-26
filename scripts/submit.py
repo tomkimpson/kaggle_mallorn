@@ -79,7 +79,7 @@ def create_model(model_type: str, device: torch.device) -> torch.nn.Module:
 def load_model(checkpoint_path: Path, model_type: str, device: torch.device):
     """Load a single model from checkpoint."""
     model = create_model(model_type, device)
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
     threshold = checkpoint.get('best_threshold', 0.5)
     return model, threshold

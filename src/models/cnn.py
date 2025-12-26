@@ -15,12 +15,12 @@ class BandEncoder(nn.Module):
     """
     1D CNN encoder for a single photometric band.
 
-    Processes a sequence of (flux, flux_err, time_delta) observations.
+    Processes a sequence of (flux, flux_err, time_delta, snr, log_flux, cumulative_time) observations.
     """
 
     def __init__(
         self,
-        in_features: int = 3,
+        in_features: int = 6,
         hidden_channels: int = 64,
         out_features: int = 128,
         kernel_size: int = 5,
@@ -93,7 +93,7 @@ class LightCurveCNN(nn.Module):
     - MLP classification head
 
     Args:
-        in_features: Number of input features per time step (default: 3 for flux, flux_err, time_delta)
+        in_features: Number of input features per time step (default: 6 for flux, flux_err, time_delta, snr, log_flux, cumulative_time)
         hidden_channels: Number of channels in conv layers
         band_embedding_dim: Output dimension per band encoder
         metadata_dim: Dimension of metadata features (Z, EBV)
@@ -104,7 +104,7 @@ class LightCurveCNN(nn.Module):
 
     def __init__(
         self,
-        in_features: int = 3,
+        in_features: int = 6,
         hidden_channels: int = 64,
         band_embedding_dim: int = 128,
         metadata_dim: int = 2,
@@ -225,7 +225,7 @@ class LightCurveCNNWithAttention(nn.Module):
 
     def __init__(
         self,
-        in_features: int = 3,
+        in_features: int = 6,
         hidden_channels: int = 64,
         band_embedding_dim: int = 128,
         metadata_dim: int = 2,

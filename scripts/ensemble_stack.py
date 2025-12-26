@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+"""
+Stacking ensemble for MALLORN TDE classification.
+
+Combines predictions from CNN, Transformer, and LightGBM using a meta-learner.
+Uses out-of-fold predictions for proper stacking to avoid leakage.
+
+Usage:
+    python scripts/ensemble_stack.py --train  # Train the stacking model
+    python scripts/ensemble_stack.py --predict  # Generate submission
+"""
+
+import argparse
+import numpy as np
+import pandas as pd
+import torch
+import joblib
+import yaml
+from pathlib import Path
+from sklearn.model_selection import StratifiedKFold
+from sklearn.linear_model import LogisticRegressionCV
+from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score
+from tqdm import tqdm
+import lightgbm as lgb
+
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from src.data import load_train_data, load_test_data
+from src.data.dataset import LightCurveDataset, create_test_loader
+from src.features.light_curve_features import extract_features_batch, get_feature_columns
+from src.models import LightCurveCNN, LightCurveTransformer
+from src.models.cnn import LightCurveCNNWithAttention
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Stacking ensemble')
+
+    parser.add_argument('--train', action='store_true',
+                        help='Train the stacking meta-model')
+    parser.add_argument('--predict', action='store_true',
+                        help='Generate predictions with trained stacker')
+
+    parser.add_argument('--cnn_dir', type=str, default='checkpoints/cnn',
+                        help='Directory with CNN fold models')
+    parser.add_argument('--transformer_dir', type=str, default='checkpoints/transformer',
+                        help='Directory with Transformer fold models')
+    parser.add_argument('--lgbm_dir', type=str, default='checkpoints/lgbm',
+                        help='Directory with LightGBM fold models')
+
+    parser.add_argument('--output_dir', type=str, default='checkpoints/ensemble',
+                        help='Output directory for stacker model')
+    parser.add_argument('--submission', type=str, default='submission_ensemble.csv',
+                        help='Output submission file')
+
+    parser.add_argument('--n_folds', type=int, default=5,
+                        help='Number of folds')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed')
+    parser.add_argument('--batch_size', type=int, default=64,
+                        help='Batch size for NN inference')
+    parser.add_argument('--max_seq_len', type=int, default=200,
+                        help='Max sequence length')
+    parser.add_argument('--device', type=str, default='auto',
+                        help='Device for NN inference')
+
+    return parser.parse_args()
+
+
+def get_device(device_str: str) -> torch.device:
+    if device_str == 'auto':
+        if torch.cuda.is_available():
+            return torch.device('cuda')
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            return torch.device('mps')
+        else:
+            return torch.device('cpu')
+    return torch.device(device_str)
+
+
+def find_optimal_threshold(y_true: np.ndarray, y_pred_proba: np.ndarray) -> tuple:
+    """Find optimal threshold that maximizes F1 score."""
+    best_f1 = 0
+    best_threshold = 0.5
+
+    for threshold in np.arange(0.05, 0.95, 0.01):
+        y_pred = (y_pred_proba >= threshold).astype(int)
+        f1 = f1_score(y_true, y_pred)
+        if f1 > best_f1:
+            best_f1 = f1
+            best_threshold = threshold
+
+    return best_threshold, best_f1
+
+
+@torch.no_grad()
+def get_nn_predictions(model, dataset, device, batch_size=64):
+    """Get predictions from a neural network model."""
+    from torch.utils.data import DataLoader
+
+    model.eval()
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+
+    all_probs = []
+    for batch in loader:
+        sequences = batch['sequences'].to(device)
+        masks = batch['masks'].to(device)
+        metadata = batch.get('metadata')
+        if metadata is not None:
+            metadata = metadata.to(device)
+
+        logits = model(sequences, masks, metadata)
+        probs = torch.sigmoid(logits).cpu().numpy()
+        all_probs.append(probs)
+
+    return np.concatenate(all_probs).flatten()
+
+
+def load_cnn_model(checkpoint_path: Path, device: torch.device):
+    """Load CNN model from checkpoint."""
+    model = LightCurveCNN(
+        in_features=6,
+        hidden_channels=64,
+        band_embedding_dim=128,
+        metadata_dim=2,
+        classifier_hidden=128,
+        dropout=0.3,
+        use_metadata=True,
+    ).to(device)
+
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    return model
+
+
+def load_transformer_model(checkpoint_path: Path, device: torch.device, max_seq_len=200):
+    """Load Transformer model from checkpoint."""
+    model = LightCurveTransformer(
+        in_features=6,
+        d_model=64,
+        n_heads=4,
+        n_layers=2,
+        dim_feedforward=256,
+        metadata_dim=2,
+        classifier_hidden=128,
+        dropout=0.1,
+        max_seq_len=max_seq_len,
+        use_metadata=True,
+    ).to(device)
+
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    return model
+
+
+def get_oof_predictions(args, train_log, train_lc, device):
+    """
+    Get out-of-fold predictions from all base models.
+
+    Returns a dictionary with OOF predictions for each model type.
+    """
+    n_samples = len(train_log)
+    skf = StratifiedKFold(n_splits=args.n_folds, shuffle=True, random_state=args.seed)
+    targets = train_log['target'].values
+
+    oof_cnn = np.zeros(n_samples)
+    oof_transformer = np.zeros(n_samples)
+    oof_lgbm = np.zeros(n_samples)
+
+    # Extract features for LightGBM
+    print("Extracting features for LightGBM...")
+    train_features = extract_features_batch(train_log, train_lc, verbose=False)
+    feature_cols = get_feature_columns()
+    X_lgbm = train_features[feature_cols].values.astype(np.float32)
+    X_lgbm = np.nan_to_num(X_lgbm, nan=0.0, posinf=0.0, neginf=0.0)
+
+    print("Getting out-of-fold predictions...")
+    for fold, (train_idx, val_idx) in enumerate(tqdm(skf.split(train_log, targets), total=args.n_folds)):
+        # Create validation dataset for NNs
+        val_log = train_log.iloc[val_idx].reset_index(drop=True)
+        val_obj_ids = set(val_log['object_id'].tolist())
+        val_lc = train_lc[train_lc['object_id'].isin(val_obj_ids)]
+
+        val_dataset = LightCurveDataset(
+            log_df=val_log,
+            lightcurves_df=val_lc,
+            max_seq_len=args.max_seq_len,
+            is_test=True,  # Don't need labels for prediction
+        )
+
+        # CNN predictions
+        cnn_path = Path(args.cnn_dir) / f'fold_{fold}' / 'best_model.pt'
+        if cnn_path.exists():
+            cnn_model = load_cnn_model(cnn_path, device)
+            oof_cnn[val_idx] = get_nn_predictions(cnn_model, val_dataset, device, args.batch_size)
+            del cnn_model
+            torch.cuda.empty_cache() if device.type == 'cuda' else None
+
+        # Transformer predictions
+        trans_path = Path(args.transformer_dir) / f'fold_{fold}' / 'best_model.pt'
+        if trans_path.exists():
+            trans_model = load_transformer_model(trans_path, device, args.max_seq_len)
+            oof_transformer[val_idx] = get_nn_predictions(trans_model, val_dataset, device, args.batch_size)
+            del trans_model
+            torch.cuda.empty_cache() if device.type == 'cuda' else None
+
+        # LightGBM predictions
+        lgbm_path = Path(args.lgbm_dir) / f'fold_{fold}' / 'model.txt'
+        if lgbm_path.exists():
+            lgbm_model = lgb.Booster(model_file=str(lgbm_path))
+            oof_lgbm[val_idx] = lgbm_model.predict(X_lgbm[val_idx])
+
+    return {
+        'cnn': oof_cnn,
+        'transformer': oof_transformer,
+        'lgbm': oof_lgbm,
+        'targets': targets,
+    }
+
+
+def get_test_predictions(args, test_log, test_lc, device):
+    """
+    Get averaged test predictions from all base models.
+
+    Each model type's predictions are averaged across folds.
+    """
+    n_samples = len(test_log)
+
+    # Extract features for LightGBM
+    print("Extracting features for LightGBM...")
+    test_features = extract_features_batch(test_log, test_lc, verbose=False)
+    feature_cols = get_feature_columns()
+    X_lgbm = test_features[feature_cols].values.astype(np.float32)
+    X_lgbm = np.nan_to_num(X_lgbm, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Create test dataset for NNs
+    test_dataset = LightCurveDataset(
+        log_df=test_log,
+        lightcurves_df=test_lc,
+        max_seq_len=args.max_seq_len,
+        is_test=True,
+    )
+
+    test_cnn = np.zeros(n_samples)
+    test_transformer = np.zeros(n_samples)
+    test_lgbm = np.zeros(n_samples)
+
+    n_cnn = 0
+    n_trans = 0
+    n_lgbm = 0
+
+    print("Getting test predictions from all folds...")
+    for fold in tqdm(range(args.n_folds)):
+        # CNN predictions
+        cnn_path = Path(args.cnn_dir) / f'fold_{fold}' / 'best_model.pt'
+        if cnn_path.exists():
+            cnn_model = load_cnn_model(cnn_path, device)
+            test_cnn += get_nn_predictions(cnn_model, test_dataset, device, args.batch_size)
+            n_cnn += 1
+            del cnn_model
+            torch.cuda.empty_cache() if device.type == 'cuda' else None
+
+        # Transformer predictions
+        trans_path = Path(args.transformer_dir) / f'fold_{fold}' / 'best_model.pt'
+        if trans_path.exists():
+            trans_model = load_transformer_model(trans_path, device, args.max_seq_len)
+            test_transformer += get_nn_predictions(trans_model, test_dataset, device, args.batch_size)
+            n_trans += 1
+            del trans_model
+            torch.cuda.empty_cache() if device.type == 'cuda' else None
+
+        # LightGBM predictions
+        lgbm_path = Path(args.lgbm_dir) / f'fold_{fold}' / 'model.txt'
+        if lgbm_path.exists():
+            lgbm_model = lgb.Booster(model_file=str(lgbm_path))
+            test_lgbm += lgbm_model.predict(X_lgbm)
+            n_lgbm += 1
+
+    # Average predictions
+    if n_cnn > 0:
+        test_cnn /= n_cnn
+    if n_trans > 0:
+        test_transformer /= n_trans
+    if n_lgbm > 0:
+        test_lgbm /= n_lgbm
+
+    return {
+        'cnn': test_cnn,
+        'transformer': test_transformer,
+        'lgbm': test_lgbm,
+        'object_ids': test_features['object_id'].tolist(),
+    }
+
+
+def train_stacker(args):
+    """Train the stacking meta-model using OOF predictions."""
+    device = get_device(args.device)
+    print(f"Using device: {device}")
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load training data
+    print("Loading training data...")
+    train_log, train_lc = load_train_data()
+    print(f"Loaded {len(train_log)} training objects")
+
+    # Get OOF predictions
+    oof = get_oof_predictions(args, train_log, train_lc, device)
+
+    # Stack features
+    available_models = []
+    stack_cols = []
+
+    if np.any(oof['cnn'] != 0):
+        available_models.append('cnn')
+        stack_cols.append(oof['cnn'])
+        print(f"CNN OOF predictions available")
+
+    if np.any(oof['transformer'] != 0):
+        available_models.append('transformer')
+        stack_cols.append(oof['transformer'])
+        print(f"Transformer OOF predictions available")
+
+    if np.any(oof['lgbm'] != 0):
+        available_models.append('lgbm')
+        stack_cols.append(oof['lgbm'])
+        print(f"LightGBM OOF predictions available")
+
+    if not stack_cols:
+        print("ERROR: No base model predictions available!")
+        return
+
+    X_stack = np.column_stack(stack_cols)
+    y = oof['targets']
+
+    print(f"\nStacking {len(available_models)} models: {available_models}")
+    print(f"Stack features shape: {X_stack.shape}")
+
+    # Train logistic regression meta-learner
+    print("\nTraining meta-learner (LogisticRegressionCV)...")
+    meta_model = LogisticRegressionCV(
+        Cs=np.logspace(-4, 4, 20),
+        cv=5,
+        scoring='f1',
+        class_weight='balanced',
+        max_iter=1000,
+        random_state=args.seed,
+    )
+    meta_model.fit(X_stack, y)
+
+    # Evaluate
+    meta_probs = meta_model.predict_proba(X_stack)[:, 1]
+    threshold, best_f1 = find_optimal_threshold(y, meta_probs)
+    meta_preds = (meta_probs >= threshold).astype(int)
+
+    precision = precision_score(y, meta_preds)
+    recall = recall_score(y, meta_preds)
+    roc_auc = roc_auc_score(y, meta_probs)
+
+    print(f"\n{'=' * 60}")
+    print("Stacking Results (on training data - optimistic estimate)")
+    print(f"{'=' * 60}")
+    print(f"F1: {best_f1:.4f}")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall: {recall:.4f}")
+    print(f"ROC-AUC: {roc_auc:.4f}")
+    print(f"Optimal Threshold: {threshold:.3f}")
+    print(f"Meta-learner C: {meta_model.C_[0]:.6f}")
+    print(f"Meta-learner coefficients: {dict(zip(available_models, meta_model.coef_[0]))}")
+
+    # Save
+    joblib.dump({
+        'meta_model': meta_model,
+        'available_models': available_models,
+        'threshold': threshold,
+    }, output_dir / 'stacker.pkl')
+
+    # Save summary
+    summary = {
+        'available_models': available_models,
+        'f1': float(best_f1),
+        'precision': float(precision),
+        'recall': float(recall),
+        'roc_auc': float(roc_auc),
+        'threshold': float(threshold),
+        'coefficients': {k: float(v) for k, v in zip(available_models, meta_model.coef_[0])},
+    }
+    with open(output_dir / 'stacker_summary.yaml', 'w') as f:
+        yaml.dump(summary, f)
+
+    print(f"\nStacker saved to: {output_dir / 'stacker.pkl'}")
+
+    # Also save OOF predictions for analysis
+    np.savez(
+        output_dir / 'oof_predictions.npz',
+        cnn=oof['cnn'],
+        transformer=oof['transformer'],
+        lgbm=oof['lgbm'],
+        targets=oof['targets'],
+        meta_probs=meta_probs,
+    )
+    print(f"OOF predictions saved to: {output_dir / 'oof_predictions.npz'}")
+
+
+def predict_stacker(args):
+    """Generate predictions using the trained stacker."""
+    device = get_device(args.device)
+    print(f"Using device: {device}")
+
+    output_dir = Path(args.output_dir)
+
+    # Load stacker
+    stacker_path = output_dir / 'stacker.pkl'
+    if not stacker_path.exists():
+        print(f"ERROR: Stacker not found at {stacker_path}")
+        print("Run with --train first to train the stacker.")
+        return
+
+    stacker_data = joblib.load(stacker_path)
+    meta_model = stacker_data['meta_model']
+    available_models = stacker_data['available_models']
+    threshold = stacker_data['threshold']
+
+    print(f"Loaded stacker with models: {available_models}")
+
+    # Load test data
+    print("\nLoading test data...")
+    test_log, test_lc = load_test_data()
+    print(f"Loaded {len(test_log)} test objects")
+
+    # Get test predictions
+    test_preds = get_test_predictions(args, test_log, test_lc, device)
+
+    # Stack in same order as training
+    stack_cols = []
+    for model_name in available_models:
+        stack_cols.append(test_preds[model_name])
+
+    X_stack = np.column_stack(stack_cols)
+    print(f"Stack features shape: {X_stack.shape}")
+
+    # Predict
+    meta_probs = meta_model.predict_proba(X_stack)[:, 1]
+    predictions = (meta_probs >= threshold).astype(int)
+
+    print(f"\nUsing threshold: {threshold:.3f}")
+    print(f"Predicted TDEs: {predictions.sum()}")
+    print(f"TDE rate: {predictions.mean():.2%}")
+
+    # Create submission
+    submission = pd.DataFrame({
+        'object_id': test_preds['object_ids'],
+        'prediction': predictions,
+    })
+
+    submission.to_csv(args.submission, index=False)
+    print(f"\nSubmission saved to: {args.submission}")
+    print(submission.head())
+
+    # Also save probabilities
+    probs_df = pd.DataFrame({
+        'object_id': test_preds['object_ids'],
+        'probability': meta_probs,
+        'cnn_prob': test_preds['cnn'],
+        'transformer_prob': test_preds['transformer'],
+        'lgbm_prob': test_preds['lgbm'],
+    })
+    probs_path = args.submission.replace('.csv', '_probs.csv')
+    probs_df.to_csv(probs_path, index=False)
+    print(f"Probabilities saved to: {probs_path}")
+
+
+def main():
+    args = parse_args()
+
+    if args.train:
+        train_stacker(args)
+    elif args.predict:
+        predict_stacker(args)
+    else:
+        print("Please specify --train or --predict")
+        print("  --train: Train the stacking meta-model using OOF predictions")
+        print("  --predict: Generate submission using trained stacker")
+
+
+if __name__ == '__main__':
+    main()

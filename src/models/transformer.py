@@ -97,7 +97,7 @@ class LightCurveTransformer(nn.Module):
     - Classification head with metadata
 
     Args:
-        in_features: Number of input features per observation (flux, flux_err, time_delta)
+        in_features: Number of input features per observation (flux, flux_err, time_delta, snr, log_flux, cumulative_time)
         d_model: Transformer model dimension
         n_heads: Number of attention heads
         n_layers: Number of transformer encoder layers
@@ -111,7 +111,7 @@ class LightCurveTransformer(nn.Module):
 
     def __init__(
         self,
-        in_features: int = 3,
+        in_features: int = 6,
         d_model: int = 64,
         n_heads: int = 4,
         n_layers: int = 2,
@@ -292,7 +292,7 @@ class LightCurveTransformerUnified(nn.Module):
 
     def __init__(
         self,
-        in_features: int = 3,
+        in_features: int = 6,
         d_model: int = 128,
         n_heads: int = 8,
         n_layers: int = 4,
