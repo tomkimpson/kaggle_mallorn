@@ -39,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.data import load_train_data, load_test_data
 from src.features.rocket import MultiChannelROCKET
+from src.features.light_curve_features import extract_features_batch, get_feature_columns
 
 BANDS = ['u', 'g', 'r', 'i', 'z', 'y']
 
@@ -73,6 +74,16 @@ def parse_args():
                         help='Run Optuna hyperparameter optimization')
     parser.add_argument('--optuna_trials', type=int, default=50,
                         help='Number of Optuna trials')
+
+    # Domain features
+    parser.add_argument('--use_domain_features', action='store_true',
+                        help='Combine ROCKET with domain-specific features (power-law decay, smoothness, etc.)')
+
+    # Feature selection
+    parser.add_argument('--feature_selection', action='store_true',
+                        help='Use feature selection to reduce to top N features')
+    parser.add_argument('--top_features', type=int, default=5000,
+                        help='Number of top features to keep (default: 5000)')
 
     # Caching
     parser.add_argument('--save_features', action='store_true',
@@ -143,6 +154,24 @@ def prepare_interpolated_data(log_df: pd.DataFrame, lc_df: pd.DataFrame,
         X[idx] = interpolate_lightcurve(obj_lc, n_points)
 
     return X
+
+
+def extract_domain_features(log_df: pd.DataFrame, lc_df: pd.DataFrame,
+                           desc: str = "Extracting domain features") -> np.ndarray:
+    """Extract domain-specific features (power-law decay, smoothness, colors, etc.)."""
+    print(f"\n{desc}...")
+    features_df = extract_features_batch(log_df, lc_df, verbose=True)
+
+    # Get feature columns (excluding object_id and target)
+    feature_cols = get_feature_columns()
+    available_cols = [c for c in feature_cols if c in features_df.columns]
+
+    print(f"Extracted {len(available_cols)} domain features")
+
+    X_domain = features_df[available_cols].values.astype(np.float32)
+    X_domain = np.nan_to_num(X_domain, nan=0.0, posinf=0.0, neginf=0.0)
+
+    return X_domain, available_cols
 
 
 def find_optimal_threshold(y_true: np.ndarray, y_pred_proba: np.ndarray) -> tuple:
@@ -239,6 +268,7 @@ def main():
     print(f"Kernels per band: {args.num_kernels}")
     print(f"Total ROCKET features: {args.num_kernels * 6 * 2}")
     print(f"Grid points: {args.grid_points}")
+    print(f"Domain features: {args.use_domain_features}")
     print(f"Optuna: {args.optuna}")
 
     # Load data
@@ -277,9 +307,23 @@ def main():
             joblib.dump(rocket, checkpoint_dir / 'rocket_transformer.pkl')
             print(f"Features saved to {features_path}")
 
+    # Extract and combine domain features if requested
+    domain_feature_cols = None
+    if args.use_domain_features:
+        X_domain, domain_feature_cols = extract_domain_features(
+            train_log, train_lc, desc="Extracting training domain features"
+        )
+        print(f"Domain features shape: {X_domain.shape}")
+
+        # Combine ROCKET and domain features
+        X_combined = np.hstack([X_rocket, X_domain])
+        print(f"Combined features shape: {X_combined.shape}")
+    else:
+        X_combined = X_rocket
+
     # Scale features
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_rocket)
+    X_scaled = scaler.fit_transform(X_combined)
 
     # LightGBM parameters
     if args.optuna:
@@ -407,6 +451,8 @@ def main():
             'params': params,
             'results': fold_results,
             'summary': summary,
+            'domain_feature_cols': domain_feature_cols,
+            'n_domain_features': len(domain_feature_cols) if domain_feature_cols else 0,
         }, f)
 
     joblib.dump(scaler, checkpoint_dir / 'scaler.pkl')
@@ -421,9 +467,117 @@ def main():
         importance += model.feature_importance(importance_type='gain')
     importance /= len(models)
 
+    # Determine feature names
+    n_rocket_features = args.num_kernels * 6 * 2
     top_idx = np.argsort(importance)[-20:][::-1]
     for rank, idx in enumerate(top_idx, 1):
-        print(f"  {rank:2d}. Feature {idx:5d}: {importance[idx]:.2f}")
+        if args.use_domain_features and idx >= n_rocket_features:
+            # This is a domain feature
+            domain_idx = idx - n_rocket_features
+            feat_name = domain_feature_cols[domain_idx] if domain_feature_cols and domain_idx < len(domain_feature_cols) else f"domain_{domain_idx}"
+            print(f"  {rank:2d}. {feat_name}: {importance[idx]:.2f}")
+        else:
+            print(f"  {rank:2d}. ROCKET_{idx:05d}: {importance[idx]:.2f}")
+
+    # If using domain features, show top domain feature importances
+    if args.use_domain_features and domain_feature_cols:
+        print(f"\n{'=' * 70}")
+        print("Top 10 Domain Feature Importances")
+        print(f"{'=' * 70}")
+        domain_importance = importance[n_rocket_features:]
+        top_domain_idx = np.argsort(domain_importance)[-10:][::-1]
+        for rank, idx in enumerate(top_domain_idx, 1):
+            feat_name = domain_feature_cols[idx] if idx < len(domain_feature_cols) else f"domain_{idx}"
+            print(f"  {rank:2d}. {feat_name}: {domain_importance[idx]:.2f}")
+
+    # Feature selection: retrain with only top features
+    selected_feature_indices = None
+    if args.feature_selection:
+        print(f"\n{'=' * 70}")
+        print(f"Feature Selection: Keeping Top {args.top_features} Features")
+        print(f"{'=' * 70}")
+
+        # Select top features by importance
+        selected_feature_indices = np.argsort(importance)[-args.top_features:]
+        X_selected = X_scaled[:, selected_feature_indices]
+        print(f"Selected features shape: {X_selected.shape}")
+
+        # Save feature indices
+        np.save(checkpoint_dir / 'selected_feature_indices.npy', selected_feature_indices)
+
+        # Retrain with selected features
+        print("\nRetraining with selected features...")
+        oof_preds_selected = np.zeros(len(y))
+        fold_results_selected = []
+        models_selected = []
+
+        for fold, (train_idx, val_idx) in enumerate(skf.split(X_selected, y)):
+            print(f"\n--- Fold {fold} (feature-selected) ---")
+
+            X_train, X_val = X_selected[train_idx], X_selected[val_idx]
+            y_train, y_val = y[train_idx], y[val_idx]
+
+            train_set = lgb.Dataset(X_train, y_train)
+            val_set = lgb.Dataset(X_val, y_val, reference=train_set)
+
+            model_sel = lgb.train(
+                params, train_set,
+                num_boost_round=args.num_boost_round,
+                valid_sets=[train_set, val_set],
+                valid_names=['train', 'valid'],
+                callbacks=[
+                    lgb.early_stopping(args.early_stopping_rounds),
+                    lgb.log_evaluation(period=100),
+                ],
+            )
+
+            val_preds_proba = model_sel.predict(X_val)
+            oof_preds_selected[val_idx] = val_preds_proba
+
+            threshold, best_f1 = find_optimal_threshold(y_val, val_preds_proba)
+            val_preds = (val_preds_proba >= threshold).astype(int)
+
+            precision = precision_score(y_val, val_preds)
+            recall = recall_score(y_val, val_preds)
+            roc_auc = roc_auc_score(y_val, val_preds_proba)
+
+            print(f"Fold {fold} (selected): F1={best_f1:.4f}, P={precision:.4f}, R={recall:.4f}")
+
+            fold_results_selected.append({
+                'fold': fold,
+                'f1': best_f1,
+                'precision': precision,
+                'recall': recall,
+                'roc_auc': roc_auc,
+                'threshold': threshold,
+            })
+
+            # Save fold model
+            fold_dir = checkpoint_dir / f'fold_{fold}_selected'
+            fold_dir.mkdir(exist_ok=True)
+            model_sel.save_model(str(fold_dir / 'model.txt'))
+            models_selected.append(model_sel)
+
+        # Summary for selected features
+        f1_selected = [r['f1'] for r in fold_results_selected]
+        avg_threshold_selected = np.mean([r['threshold'] for r in fold_results_selected])
+
+        print(f"\n{'=' * 70}")
+        print("Feature Selection Results")
+        print(f"{'=' * 70}")
+        print(f"F1 (all features): {summary['f1_mean']:.4f} +/- {summary['f1_std']:.4f}")
+        print(f"F1 (top {args.top_features}): {np.mean(f1_selected):.4f} +/- {np.std(f1_selected):.4f}")
+
+        # Use selected models if they perform better
+        if np.mean(f1_selected) >= summary['f1_mean'] - 0.01:  # Allow 1% tolerance
+            print("Using feature-selected models (performance maintained)")
+            models = models_selected
+            avg_threshold = avg_threshold_selected
+            summary['f1_selected'] = float(np.mean(f1_selected))
+            summary['f1_selected_std'] = float(np.std(f1_selected))
+        else:
+            print("Keeping all features (feature selection reduced performance)")
+            selected_feature_indices = None
 
     # Generate test predictions
     print(f"\n{'=' * 70}")
@@ -447,7 +601,23 @@ def main():
 
     print("Applying ROCKET transform...")
     X_test_rocket = rocket.transform(X_test_interp)
-    X_test_scaled = scaler.transform(X_test_rocket)
+
+    # Extract and combine domain features for test data if used in training
+    if args.use_domain_features:
+        X_test_domain, _ = extract_domain_features(
+            test_log, test_lc, desc="Extracting test domain features"
+        )
+        X_test_combined = np.hstack([X_test_rocket, X_test_domain])
+        print(f"Test combined features shape: {X_test_combined.shape}")
+    else:
+        X_test_combined = X_test_rocket
+
+    X_test_scaled = scaler.transform(X_test_combined)
+
+    # Apply feature selection if used
+    if selected_feature_indices is not None:
+        X_test_scaled = X_test_scaled[:, selected_feature_indices]
+        print(f"Applied feature selection: {X_test_scaled.shape}")
 
     # Ensemble predictions
     test_preds_proba = np.zeros(len(X_test_scaled))
@@ -483,10 +653,11 @@ def main():
     print("Training Complete!")
     print(f"{'=' * 70}")
     f1_str = f"{summary['f1_mean']:.2f}"
+    domain_str = "+domain" if args.use_domain_features else ""
     print(f"\nTo submit to Kaggle:")
     print(f"  source venv/bin/activate && export KAGGLE_API_TOKEN=KGAT_209f2e6f5fd3bc6c81588500c431b21c && \\")
     print(f"  kaggle competitions submit -c mallorn-astronomical-classification-challenge \\")
-    print(f"    -f {args.output} -m 'ROCKET+LightGBM {args.num_kernels}k CV F1={f1_str}'")
+    print(f"    -f {args.output} -m 'ROCKET+LightGBM {args.num_kernels}k{domain_str} CV F1={f1_str}'")
 
 
 if __name__ == '__main__':

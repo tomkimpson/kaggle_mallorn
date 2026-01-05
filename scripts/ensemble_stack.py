@@ -2,12 +2,13 @@
 """
 Stacking ensemble for MALLORN TDE classification.
 
-Combines predictions from CNN, Transformer, and LightGBM using a meta-learner.
+Combines predictions from CNN, Transformer, LightGBM, and ROCKET+LightGBM using a meta-learner.
 Uses out-of-fold predictions for proper stacking to avoid leakage.
 
 Usage:
     python scripts/ensemble_stack.py --train  # Train the stacking model
     python scripts/ensemble_stack.py --predict  # Generate submission
+    python scripts/ensemble_stack.py --train --rocket_lgbm_dir checkpoints/rocket_domain_5k
 """
 
 import argparse
@@ -20,6 +21,7 @@ from pathlib import Path
 from sklearn.model_selection import StratifiedKFold
 from sklearn.linear_model import LogisticRegressionCV
 from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score
+from scipy.optimize import minimize
 from tqdm import tqdm
 import lightgbm as lgb
 
@@ -29,8 +31,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.data import load_train_data, load_test_data
 from src.data.dataset import LightCurveDataset, create_test_loader
 from src.features.light_curve_features import extract_features_batch, get_feature_columns
+from src.features.rocket import MultiChannelROCKET
 from src.models import LightCurveCNN, LightCurveTransformer
 from src.models.cnn import LightCurveCNNWithAttention
+
+BANDS = ['u', 'g', 'r', 'i', 'z', 'y']
 
 
 def parse_args():
@@ -47,6 +52,10 @@ def parse_args():
                         help='Directory with Transformer fold models')
     parser.add_argument('--lgbm_dir', type=str, default='checkpoints/lgbm',
                         help='Directory with LightGBM fold models')
+    parser.add_argument('--rocket_lgbm_dir', type=str, default='checkpoints/rocket_domain_5k',
+                        help='Directory with ROCKET+LightGBM fold models (best model)')
+    parser.add_argument('--grid_points', type=int, default=100,
+                        help='Number of grid points for ROCKET interpolation')
 
     parser.add_argument('--output_dir', type=str, default='checkpoints/ensemble',
                         help='Output directory for stacker model')
@@ -64,6 +73,10 @@ def parse_args():
     parser.add_argument('--device', type=str, default='auto',
                         help='Device for NN inference')
 
+    # Ensemble method
+    parser.add_argument('--use_weighted_avg', action='store_true',
+                        help='Use optimized weighted averaging instead of logistic regression')
+
     return parser.parse_args()
 
 
@@ -76,6 +89,62 @@ def get_device(device_str: str) -> torch.device:
         else:
             return torch.device('cpu')
     return torch.device(device_str)
+
+
+def interpolate_lightcurve(obj_lc: pd.DataFrame, n_points: int = 100) -> np.ndarray:
+    """Linear interpolation to regular grid for ROCKET."""
+    result = np.zeros((6, n_points))
+
+    all_times = obj_lc['Time (MJD)'].dropna()
+    if len(all_times) == 0:
+        return result
+
+    t_min, t_max = all_times.min(), all_times.max()
+    if t_max <= t_min:
+        return result
+
+    t_grid = np.linspace(t_min, t_max, n_points)
+
+    for i, band in enumerate(BANDS):
+        band_data = obj_lc[obj_lc['Filter'] == band].sort_values('Time (MJD)')
+        if len(band_data) < 2:
+            continue
+
+        t = band_data['Time (MJD)'].values
+        f = band_data['Flux'].values
+
+        valid = ~(np.isnan(t) | np.isnan(f))
+        t, f = t[valid], f[valid]
+
+        if len(t) < 2:
+            continue
+
+        # Normalize flux
+        f_scale = np.max(np.abs(f)) if np.max(np.abs(f)) > 0 else 1.0
+        f = f / f_scale
+
+        result[i] = np.interp(t_grid, t, f, left=0, right=0)
+
+    return result
+
+
+def prepare_interpolated_data(log_df: pd.DataFrame, lc_df: pd.DataFrame,
+                               n_points: int, desc: str = "Interpolating") -> np.ndarray:
+    """Prepare interpolated light curve data for ROCKET."""
+    n_samples = len(log_df)
+    X = np.zeros((n_samples, 6, n_points))
+
+    lc_groups = lc_df.groupby('object_id')
+
+    for idx, row in tqdm(log_df.iterrows(), total=n_samples, desc=desc):
+        obj_id = row['object_id']
+        try:
+            obj_lc = lc_groups.get_group(obj_id)
+        except KeyError:
+            continue
+        X[idx] = interpolate_lightcurve(obj_lc, n_points)
+
+    return X
 
 
 def find_optimal_threshold(y_true: np.ndarray, y_pred_proba: np.ndarray) -> tuple:
@@ -91,6 +160,64 @@ def find_optimal_threshold(y_true: np.ndarray, y_pred_proba: np.ndarray) -> tupl
             best_threshold = threshold
 
     return best_threshold, best_f1
+
+
+def optimize_weights(predictions_list: list, targets: np.ndarray) -> tuple:
+    """
+    Optimize ensemble weights to maximize F1 score.
+
+    Args:
+        predictions_list: List of prediction arrays from different models
+        targets: Ground truth labels
+
+    Returns:
+        Tuple of (optimal_weights, best_f1, optimal_threshold)
+    """
+    n_models = len(predictions_list)
+
+    def objective(weights):
+        # Normalize weights to sum to 1
+        weights = np.array(weights)
+        weights = weights / weights.sum()
+
+        # Weighted average predictions
+        ensemble_pred = np.zeros_like(predictions_list[0])
+        for w, pred in zip(weights, predictions_list):
+            ensemble_pred += w * pred
+
+        # Find best F1 for this weight combination
+        _, best_f1 = find_optimal_threshold(targets, ensemble_pred)
+        return -best_f1  # Minimize negative F1
+
+    # Initial weights (equal)
+    initial_weights = np.ones(n_models) / n_models
+
+    # Bounds: each weight between 0 and 1
+    bounds = [(0, 1) for _ in range(n_models)]
+
+    # Constraint: weights sum to 1
+    constraints = {'type': 'eq', 'fun': lambda w: np.sum(w) - 1}
+
+    # Optimize
+    result = minimize(
+        objective,
+        initial_weights,
+        method='SLSQP',
+        bounds=bounds,
+        constraints=constraints,
+        options={'maxiter': 1000}
+    )
+
+    optimal_weights = result.x / result.x.sum()
+
+    # Calculate ensemble with optimal weights
+    ensemble_pred = np.zeros_like(predictions_list[0])
+    for w, pred in zip(optimal_weights, predictions_list):
+        ensemble_pred += w * pred
+
+    threshold, best_f1 = find_optimal_threshold(targets, ensemble_pred)
+
+    return optimal_weights, best_f1, threshold, ensemble_pred
 
 
 @torch.no_grad()
@@ -166,6 +293,7 @@ def get_oof_predictions(args, train_log, train_lc, device):
     oof_cnn = np.zeros(n_samples)
     oof_transformer = np.zeros(n_samples)
     oof_lgbm = np.zeros(n_samples)
+    oof_rocket_lgbm = np.zeros(n_samples)
 
     # Extract features for LightGBM
     print("Extracting features for LightGBM...")
@@ -173,6 +301,39 @@ def get_oof_predictions(args, train_log, train_lc, device):
     feature_cols = get_feature_columns()
     X_lgbm = train_features[feature_cols].values.astype(np.float32)
     X_lgbm = np.nan_to_num(X_lgbm, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Prepare ROCKET features if checkpoint exists
+    rocket_lgbm_dir = Path(args.rocket_lgbm_dir)
+    X_rocket_scaled = None
+    rocket_available = False
+
+    if (rocket_lgbm_dir / 'fold_0' / 'model.txt').exists():
+        print("Preparing ROCKET features for ensemble...")
+
+        # Check if pre-computed features exist
+        features_path = rocket_lgbm_dir / 'train_features.npz'
+        rocket_transformer_path = rocket_lgbm_dir / 'rocket_transformer.pkl'
+        scaler_path = rocket_lgbm_dir / 'scaler.pkl'
+
+        if features_path.exists() and scaler_path.exists():
+            print("Loading pre-computed ROCKET features...")
+            cached = np.load(features_path)
+            X_rocket = cached['X_rocket']
+            scaler = joblib.load(scaler_path)
+            X_rocket_scaled = scaler.transform(X_rocket)
+            rocket_available = True
+        elif rocket_transformer_path.exists() and scaler_path.exists():
+            print("Computing ROCKET features from scratch...")
+            X_interp = prepare_interpolated_data(
+                train_log, train_lc, n_points=args.grid_points, desc="Interpolating train for ROCKET"
+            )
+            rocket = joblib.load(rocket_transformer_path)
+            X_rocket = rocket.transform(X_interp)
+            scaler = joblib.load(scaler_path)
+            X_rocket_scaled = scaler.transform(X_rocket)
+            rocket_available = True
+        else:
+            print("Warning: ROCKET checkpoint found but missing transformer/scaler. Skipping.")
 
     print("Getting out-of-fold predictions...")
     for fold, (train_idx, val_idx) in enumerate(tqdm(skf.split(train_log, targets), total=args.n_folds)):
@@ -210,10 +371,18 @@ def get_oof_predictions(args, train_log, train_lc, device):
             lgbm_model = lgb.Booster(model_file=str(lgbm_path))
             oof_lgbm[val_idx] = lgbm_model.predict(X_lgbm[val_idx])
 
+        # ROCKET+LightGBM predictions (best model)
+        if rocket_available and X_rocket_scaled is not None:
+            rocket_lgbm_path = rocket_lgbm_dir / f'fold_{fold}' / 'model.txt'
+            if rocket_lgbm_path.exists():
+                rocket_model = lgb.Booster(model_file=str(rocket_lgbm_path))
+                oof_rocket_lgbm[val_idx] = rocket_model.predict(X_rocket_scaled[val_idx])
+
     return {
         'cnn': oof_cnn,
         'transformer': oof_transformer,
         'lgbm': oof_lgbm,
+        'rocket_lgbm': oof_rocket_lgbm,
         'targets': targets,
     }
 
@@ -233,6 +402,26 @@ def get_test_predictions(args, test_log, test_lc, device):
     X_lgbm = test_features[feature_cols].values.astype(np.float32)
     X_lgbm = np.nan_to_num(X_lgbm, nan=0.0, posinf=0.0, neginf=0.0)
 
+    # Prepare ROCKET features if checkpoint exists
+    rocket_lgbm_dir = Path(args.rocket_lgbm_dir)
+    X_rocket_scaled = None
+    rocket_available = False
+
+    if (rocket_lgbm_dir / 'fold_0' / 'model.txt').exists():
+        print("Preparing test ROCKET features...")
+        rocket_transformer_path = rocket_lgbm_dir / 'rocket_transformer.pkl'
+        scaler_path = rocket_lgbm_dir / 'scaler.pkl'
+
+        if rocket_transformer_path.exists() and scaler_path.exists():
+            X_interp = prepare_interpolated_data(
+                test_log, test_lc, n_points=args.grid_points, desc="Interpolating test for ROCKET"
+            )
+            rocket = joblib.load(rocket_transformer_path)
+            X_rocket = rocket.transform(X_interp)
+            scaler = joblib.load(scaler_path)
+            X_rocket_scaled = scaler.transform(X_rocket)
+            rocket_available = True
+
     # Create test dataset for NNs
     test_dataset = LightCurveDataset(
         log_df=test_log,
@@ -244,10 +433,12 @@ def get_test_predictions(args, test_log, test_lc, device):
     test_cnn = np.zeros(n_samples)
     test_transformer = np.zeros(n_samples)
     test_lgbm = np.zeros(n_samples)
+    test_rocket_lgbm = np.zeros(n_samples)
 
     n_cnn = 0
     n_trans = 0
     n_lgbm = 0
+    n_rocket = 0
 
     print("Getting test predictions from all folds...")
     for fold in tqdm(range(args.n_folds)):
@@ -276,6 +467,14 @@ def get_test_predictions(args, test_log, test_lc, device):
             test_lgbm += lgbm_model.predict(X_lgbm)
             n_lgbm += 1
 
+        # ROCKET+LightGBM predictions
+        if rocket_available and X_rocket_scaled is not None:
+            rocket_lgbm_path = rocket_lgbm_dir / f'fold_{fold}' / 'model.txt'
+            if rocket_lgbm_path.exists():
+                rocket_model = lgb.Booster(model_file=str(rocket_lgbm_path))
+                test_rocket_lgbm += rocket_model.predict(X_rocket_scaled)
+                n_rocket += 1
+
     # Average predictions
     if n_cnn > 0:
         test_cnn /= n_cnn
@@ -283,11 +482,14 @@ def get_test_predictions(args, test_log, test_lc, device):
         test_transformer /= n_trans
     if n_lgbm > 0:
         test_lgbm /= n_lgbm
+    if n_rocket > 0:
+        test_rocket_lgbm /= n_rocket
 
     return {
         'cnn': test_cnn,
         'transformer': test_transformer,
         'lgbm': test_lgbm,
+        'rocket_lgbm': test_rocket_lgbm,
         'object_ids': test_features['object_id'].tolist(),
     }
 
@@ -327,6 +529,11 @@ def train_stacker(args):
         stack_cols.append(oof['lgbm'])
         print(f"LightGBM OOF predictions available")
 
+    if np.any(oof['rocket_lgbm'] != 0):
+        available_models.append('rocket_lgbm')
+        stack_cols.append(oof['rocket_lgbm'])
+        print(f"ROCKET+LightGBM OOF predictions available (best single model)")
+
     if not stack_cols:
         print("ERROR: No base model predictions available!")
         return
@@ -337,55 +544,100 @@ def train_stacker(args):
     print(f"\nStacking {len(available_models)} models: {available_models}")
     print(f"Stack features shape: {X_stack.shape}")
 
-    # Train logistic regression meta-learner
-    print("\nTraining meta-learner (LogisticRegressionCV)...")
-    meta_model = LogisticRegressionCV(
-        Cs=np.logspace(-4, 4, 20),
-        cv=5,
-        scoring='f1',
-        class_weight='balanced',
-        max_iter=1000,
-        random_state=args.seed,
-    )
-    meta_model.fit(X_stack, y)
+    if args.use_weighted_avg:
+        # Weighted averaging approach
+        print("\nOptimizing ensemble weights...")
+        optimal_weights, best_f1, threshold, meta_probs = optimize_weights(stack_cols, y)
 
-    # Evaluate
-    meta_probs = meta_model.predict_proba(X_stack)[:, 1]
-    threshold, best_f1 = find_optimal_threshold(y, meta_probs)
-    meta_preds = (meta_probs >= threshold).astype(int)
+        meta_preds = (meta_probs >= threshold).astype(int)
+        precision = precision_score(y, meta_preds)
+        recall = recall_score(y, meta_preds)
+        roc_auc = roc_auc_score(y, meta_probs)
 
-    precision = precision_score(y, meta_preds)
-    recall = recall_score(y, meta_preds)
-    roc_auc = roc_auc_score(y, meta_probs)
+        print(f"\n{'=' * 60}")
+        print("Weighted Averaging Results (on training data)")
+        print(f"{'=' * 60}")
+        print(f"F1: {best_f1:.4f}")
+        print(f"Precision: {precision:.4f}")
+        print(f"Recall: {recall:.4f}")
+        print(f"ROC-AUC: {roc_auc:.4f}")
+        print(f"Optimal Threshold: {threshold:.3f}")
+        print(f"Optimal Weights: {dict(zip(available_models, optimal_weights))}")
 
-    print(f"\n{'=' * 60}")
-    print("Stacking Results (on training data - optimistic estimate)")
-    print(f"{'=' * 60}")
-    print(f"F1: {best_f1:.4f}")
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall: {recall:.4f}")
-    print(f"ROC-AUC: {roc_auc:.4f}")
-    print(f"Optimal Threshold: {threshold:.3f}")
-    print(f"Meta-learner C: {meta_model.C_[0]:.6f}")
-    print(f"Meta-learner coefficients: {dict(zip(available_models, meta_model.coef_[0]))}")
+        # Save
+        joblib.dump({
+            'method': 'weighted_avg',
+            'weights': optimal_weights,
+            'available_models': available_models,
+            'threshold': threshold,
+        }, output_dir / 'stacker.pkl')
 
-    # Save
-    joblib.dump({
-        'meta_model': meta_model,
-        'available_models': available_models,
-        'threshold': threshold,
-    }, output_dir / 'stacker.pkl')
+        # Summary for weighted avg
+        summary = {
+            'method': 'weighted_avg',
+            'available_models': available_models,
+            'f1': float(best_f1),
+            'precision': float(precision),
+            'recall': float(recall),
+            'roc_auc': float(roc_auc),
+            'threshold': float(threshold),
+            'weights': {k: float(v) for k, v in zip(available_models, optimal_weights)},
+        }
 
-    # Save summary
-    summary = {
-        'available_models': available_models,
-        'f1': float(best_f1),
-        'precision': float(precision),
-        'recall': float(recall),
-        'roc_auc': float(roc_auc),
-        'threshold': float(threshold),
-        'coefficients': {k: float(v) for k, v in zip(available_models, meta_model.coef_[0])},
-    }
+    else:
+        # Logistic regression meta-learner
+        print("\nTraining meta-learner (LogisticRegressionCV)...")
+        meta_model = LogisticRegressionCV(
+            Cs=np.logspace(-4, 4, 20),
+            cv=5,
+            scoring='f1',
+            class_weight='balanced',
+            max_iter=1000,
+            random_state=args.seed,
+        )
+        meta_model.fit(X_stack, y)
+
+        # Evaluate
+        meta_probs = meta_model.predict_proba(X_stack)[:, 1]
+        threshold, best_f1 = find_optimal_threshold(y, meta_probs)
+        meta_preds = (meta_probs >= threshold).astype(int)
+
+        precision = precision_score(y, meta_preds)
+        recall = recall_score(y, meta_preds)
+        roc_auc = roc_auc_score(y, meta_probs)
+
+        print(f"\n{'=' * 60}")
+        print("Stacking Results (on training data - optimistic estimate)")
+        print(f"{'=' * 60}")
+        print(f"F1: {best_f1:.4f}")
+        print(f"Precision: {precision:.4f}")
+        print(f"Recall: {recall:.4f}")
+        print(f"ROC-AUC: {roc_auc:.4f}")
+        print(f"Optimal Threshold: {threshold:.3f}")
+        print(f"Meta-learner C: {meta_model.C_[0]:.6f}")
+        print(f"Meta-learner coefficients: {dict(zip(available_models, meta_model.coef_[0]))}")
+
+        # Save
+        joblib.dump({
+            'method': 'logistic_regression',
+            'meta_model': meta_model,
+            'available_models': available_models,
+            'threshold': threshold,
+        }, output_dir / 'stacker.pkl')
+
+        # Summary for logistic regression
+        summary = {
+            'method': 'logistic_regression',
+            'available_models': available_models,
+            'f1': float(best_f1),
+            'precision': float(precision),
+            'recall': float(recall),
+            'roc_auc': float(roc_auc),
+            'threshold': float(threshold),
+            'coefficients': {k: float(v) for k, v in zip(available_models, meta_model.coef_[0])},
+        }
+
+    # Save summary (using the summary from either branch above)
     with open(output_dir / 'stacker_summary.yaml', 'w') as f:
         yaml.dump(summary, f)
 
@@ -397,6 +649,7 @@ def train_stacker(args):
         cnn=oof['cnn'],
         transformer=oof['transformer'],
         lgbm=oof['lgbm'],
+        rocket_lgbm=oof['rocket_lgbm'],
         targets=oof['targets'],
         meta_probs=meta_probs,
     )
@@ -418,11 +671,12 @@ def predict_stacker(args):
         return
 
     stacker_data = joblib.load(stacker_path)
-    meta_model = stacker_data['meta_model']
     available_models = stacker_data['available_models']
     threshold = stacker_data['threshold']
+    method = stacker_data.get('method', 'logistic_regression')
 
     print(f"Loaded stacker with models: {available_models}")
+    print(f"Ensemble method: {method}")
 
     # Load test data
     print("\nLoading test data...")
@@ -440,8 +694,17 @@ def predict_stacker(args):
     X_stack = np.column_stack(stack_cols)
     print(f"Stack features shape: {X_stack.shape}")
 
-    # Predict
-    meta_probs = meta_model.predict_proba(X_stack)[:, 1]
+    # Predict based on method
+    if method == 'weighted_avg':
+        weights = stacker_data['weights']
+        meta_probs = np.zeros(len(stack_cols[0]))
+        for w, pred in zip(weights, stack_cols):
+            meta_probs += w * pred
+        print(f"Using weighted averaging with weights: {dict(zip(available_models, weights))}")
+    else:
+        meta_model = stacker_data['meta_model']
+        meta_probs = meta_model.predict_proba(X_stack)[:, 1]
+
     predictions = (meta_probs >= threshold).astype(int)
 
     print(f"\nUsing threshold: {threshold:.3f}")
@@ -465,6 +728,7 @@ def predict_stacker(args):
         'cnn_prob': test_preds['cnn'],
         'transformer_prob': test_preds['transformer'],
         'lgbm_prob': test_preds['lgbm'],
+        'rocket_lgbm_prob': test_preds['rocket_lgbm'],
     })
     probs_path = args.submission.replace('.csv', '_probs.csv')
     probs_df.to_csv(probs_path, index=False)

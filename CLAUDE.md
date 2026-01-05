@@ -1,4 +1,8 @@
-Use 'bd' for task tracking
+Use 'bd' for task tracking. Be proactive - create beads when:
+- Submitting SLURM jobs
+- Starting multi-step experiments
+- Leaving work incomplete
+- Any task that spans sessions
 
 ## Kaggle Submission
 

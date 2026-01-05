@@ -1,8 +1,8 @@
-# MALLORN Challenge: Mid-Stage Review
+# MALLORN Challenge: Progress Review
 
 **Project**: Tidal Disruption Event Classification
 **Competition**: [Kaggle MALLORN Astronomical Classification Challenge](https://www.kaggle.com/competitions/mallorn-astronomical-classification-challenge)
-**Date**: December 2025
+**Last Updated**: January 2026
 
 ---
 
@@ -91,7 +91,7 @@ A Transformer-based architecture with:
 
 ### 3.2 Feature-Based Models
 
-#### 3.2.1 ROCKET + LightGBM
+#### 3.2.1 ROCKET + LightGBM (Baseline)
 
 ROCKET (Random Convolutional Kernel Transform) is a time series feature extraction method that:
 - Applies thousands of random convolutional kernels with varying dilations
@@ -113,6 +113,45 @@ ROCKET (Random Convolutional Kernel Transform) is a time series feature extracti
 | Feature Fraction | 0.8 |
 | Bagging Fraction | 0.8 |
 | Early Stopping | 50 rounds |
+
+#### 3.2.2 ROCKET + Domain Features (New)
+
+Building on the baseline ROCKET approach, we added **138 physics-informed domain features** to capture astrophysically meaningful characteristics of TDEs.
+
+**Domain Features (per band, 6 bands × 20 features = 120 features)**:
+- **Peak characteristics**: peak_flux, peak_time, mean_flux, std_flux, median_flux
+- **Statistical moments**: skewness, kurtosis
+- **Temporal evolution**: rise_time, decay_rate, amplitude_ratio, duration
+- **Signal quality**: above_baseline_frac, snr_mean, snr_max
+- **TDE-specific**: decay_chi2, decay_alpha_dev (deviation from t^-5/3 power law)
+- **Smoothness metrics**: n_inflection_points, max_acceleration, monotonic_ratio, roughness
+
+**Cross-band features (18 features)**:
+- Color indices: g-r, r-i, i-z, u-g
+- Peak time differences between bands
+- Total flux statistics
+- Color evolution: g-r and u-g colors at peak, at +30 days, and evolution rate
+
+**Combined feature space**: 60,000 (ROCKET) + 138 (domain) = 60,138 features
+
+#### 3.2.3 ROCKET + Domain + Optuna Tuning (In Progress)
+
+We are currently running Optuna hyperparameter optimization to find optimal LightGBM parameters for the domain-enhanced feature set.
+
+**Optuna Search Space**:
+- num_leaves: [15, 127]
+- learning_rate: [0.01, 0.3]
+- feature_fraction: [0.4, 1.0]
+- bagging_fraction: [0.4, 1.0]
+- min_child_samples: [5, 100]
+- reg_alpha: [1e-8, 10.0]
+- reg_lambda: [1e-8, 10.0]
+
+**Early Results** (2 trials completed before timeout):
+- Trial 0: F1 = 0.473
+- Trial 1: F1 = **0.541** (significant improvement!)
+
+**Current Status**: Job 8156808 running with 20 trials, 30-hour time limit.
 
 ---
 
@@ -164,12 +203,24 @@ Given the severe class imbalance (5% TDEs), we employed multiple strategies:
 
 | Model | F1 Score | Precision | Recall | ROC-AUC | Threshold |
 |-------|----------|-----------|--------|---------|-----------|
-| **ROCKET + LightGBM (5K)** | **0.458 ± 0.105** | 0.445 | 0.481 | 0.902 | 0.18 |
-| **ROCKET + LightGBM (2K)** | **0.462 ± 0.112** | 0.431 | 0.540 | 0.890 | 0.16 |
+| **ROCKET + Domain + Optuna** | **~0.54** | - | - | - | - | *In progress* |
+| **ROCKET + Domain (5K)** | **0.481 ± 0.097** | 0.436 | 0.595 | 0.915 | 0.16 |
+| ROCKET + LightGBM (5K) | 0.458 ± 0.105 | 0.445 | 0.481 | 0.902 | 0.18 |
+| ROCKET + LightGBM (2K) | 0.462 ± 0.112 | 0.431 | 0.540 | 0.890 | 0.16 |
 | Transformer | 0.191 ± 0.033 | 0.145 | 0.352 | 0.732 | 0.66 |
 | CNN | 0.166 ± 0.019 | 0.112 | 0.338 | 0.566 | 0.61 |
 
-### Per-Fold Breakdown (Best Model: ROCKET + LightGBM 5K)
+### Per-Fold Breakdown: ROCKET + Domain Features (5K)
+
+| Fold | F1 | Precision | Recall | ROC-AUC |
+|------|-----|-----------|--------|---------|
+| 0 | 0.324 | 0.227 | 0.567 | 0.866 |
+| 1 | 0.490 | 0.632 | 0.400 | 0.904 |
+| 2 | 0.630 | 0.535 | 0.767 | 0.952 |
+| 3 | 0.475 | 0.373 | 0.655 | 0.930 |
+| 4 | 0.486 | 0.415 | 0.586 | 0.925 |
+
+### Per-Fold Breakdown: ROCKET + LightGBM (5K, Baseline)
 
 | Fold | F1 | Precision | Recall | ROC-AUC |
 |------|-----|-----------|--------|---------|
@@ -183,8 +234,9 @@ Given the severe class imbalance (5% TDEs), we employed multiple strategies:
 
 | Submission File | Model | CV F1 | Test Predictions |
 |-----------------|-------|-------|------------------|
-| `submission_rocket_lgbm_5k.csv` | ROCKET+LGBM (5K kernels) | 0.458 | 317 TDEs |
-| `submission_rocket_lgbm_2k.csv` | ROCKET+LGBM (2K kernels) | 0.462 | 408 TDEs |
+| `submission_rocket_domain_5k.csv` | ROCKET+Domain (5K) | 0.481 | - |
+| `submission_rocket_lgbm_5k.csv` | ROCKET+LGBM (5K) | 0.458 | 317 TDEs |
+| `submission_rocket_lgbm_2k.csv` | ROCKET+LGBM (2K) | 0.462 | 408 TDEs |
 | `submission_transformer_ensemble.csv` | Transformer (5-fold) | 0.191 | - |
 | `submission_baseline_cnn.csv` | CNN | 0.166 | - |
 
@@ -199,57 +251,100 @@ The ROCKET + LightGBM approach achieved **2.4x higher F1 scores** than deep lear
 - ROCKET's random kernels capture diverse temporal patterns
 - Gradient boosting handles tabular features effectively
 
-### 7.2 High Variance Across Folds
+### 7.2 Domain Features Improve Performance
 
-F1 scores vary significantly across folds (0.30 to 0.60), indicating:
+Adding 138 physics-informed features improved CV F1 from 0.458 to **0.481** (+5%):
+- Higher recall (0.595 vs 0.481) - catching more TDEs
+- Improved ROC-AUC (0.915 vs 0.902)
+- Key features likely include color evolution and decay characteristics
+
+### 7.3 Optuna Shows Strong Potential
+
+Early Optuna trials suggest significant headroom for improvement:
+- Trial 1 achieved F1 = **0.541** vs baseline 0.481
+- Hyperparameter tuning appears critical for this feature-rich model
+- Full 20-trial optimization in progress
+
+### 7.4 High Variance Across Folds
+
+F1 scores vary significantly across folds (0.30 to 0.63), indicating:
 - TDE population heterogeneity
 - Limited positive samples per fold (~30)
 - Model sensitivity to specific TDE subtypes
 
-### 7.3 Precision-Recall Trade-off
+### 7.5 Precision-Recall Trade-off
 
 - Deep learning models have low precision (~11-14%) but moderate recall (~34-35%)
-- ROCKET models achieve better balance (precision ~44%, recall ~48-54%)
+- ROCKET models achieve better balance (precision ~44%, recall ~48-60%)
+- Domain features shift toward higher recall at some precision cost
 - Optimal thresholds are well below 0.5 for ROCKET (~0.16-0.18)
 
 ---
 
 ## 8. Infrastructure
 
-- **Compute**: SLURM cluster with CUDA GPUs
-- **Framework**: PyTorch 2.0+, scikit-learn, LightGBM
-- **Training Time**: ~1 hour for ROCKET+LGBM, ~2 hours for deep learning (5-fold)
+- **Compute**: SLURM cluster (OzSTAR) with CUDA GPUs
+- **Framework**: PyTorch 2.0+, scikit-learn, LightGBM, Optuna
+- **Training Time**:
+  - ~1 hour for ROCKET+LGBM feature extraction
+  - ~45 min per Optuna trial (5-fold CV with 60K features)
+  - ~2 hours for deep learning (5-fold)
+- **Task Tracking**: `bd` (beads) for issue management
 
 ---
 
-## 9. Potential Next Steps
+## 9. Progress Timeline
 
-1. **Ensemble Methods**
-   - Stack predictions from multiple models
-   - Weighted average of ROCKET variants
+| Date | Milestone | CV F1 |
+|------|-----------|-------|
+| Dec 22 | CNN baseline complete | 0.166 |
+| Dec 22 | Transformer baseline complete | 0.191 |
+| Dec 23 | ROCKET + LightGBM (5K) | 0.458 |
+| Dec 24 | ROCKET + LightGBM (2K) | 0.462 |
+| Dec 26 | ROCKET + Domain Features | 0.481 |
+| Jan 5 | Optuna tuning started | ~0.54 (early) |
 
-2. **Additional Features**
-   - Hand-crafted astronomical features (rise time, decay rate, colors)
-   - Gaussian Process interpolation for smoother light curves
+---
 
-3. **Hyperparameter Optimization**
-   - Optuna-based tuning for LightGBM
-   - Architecture search for neural networks
+## 10. Next Steps
 
-4. **Semi-Supervised Learning**
+### Immediate (In Progress)
+1. **Complete Optuna Tuning** (Job 8156808)
+   - 20 trials with domain-enhanced features
+   - Expected completion: ~15-20 hours
+
+### Short Term
+2. **Ensemble Stacking**
+   - Combine ROCKET variants with optimized model
+   - Weighted averaging of diverse models
+   - Scripts ready: `scripts/ensemble_stack.py`
+
+3. **XGBoost Comparison**
+   - Alternative to LightGBM
+   - Script ready: `scripts/train_rocket_xgboost.py`
+
+### Medium Term
+4. **Feature Selection**
+   - Identify most predictive domain features
+   - Reduce dimensionality for faster training
+
+5. **Calibration**
+   - Isotonic regression on predicted probabilities
+   - Better threshold optimization
+
+### Longer Term
+6. **Semi-Supervised Learning**
    - Pseudo-labeling on high-confidence test predictions
    - Self-training iterations
 
-5. **Data Augmentation**
+7. **Data Augmentation**
    - Time warping
    - Noise injection
    - Synthetic TDE generation
 
 ---
 
-## 10. Summary
-
-We have implemented and evaluated four approaches for TDE classification:
+## 11. Summary
 
 | Approach | Status | Best CV F1 |
 |----------|--------|------------|
@@ -257,10 +352,30 @@ We have implemented and evaluated four approaches for TDE classification:
 | Transformer | Complete | 0.191 |
 | ROCKET + LightGBM (2K) | Complete | 0.462 |
 | ROCKET + LightGBM (5K) | Complete | 0.458 |
+| ROCKET + Domain Features | Complete | 0.481 |
+| ROCKET + Domain + Optuna | **In Progress** | ~0.54 (early) |
 
-**Current best approach**: ROCKET + LightGBM with ~0.46 CV F1 score.
+**Current best approach**: ROCKET + Domain Features with Optuna tuning, showing early F1 of ~0.54.
 
-The feature-based approach substantially outperforms deep learning on this dataset, likely due to the limited training size and the effectiveness of random convolutional kernels for capturing time series patterns.
+The feature-based approach substantially outperforms deep learning on this dataset. Adding physics-informed domain features and hyperparameter optimization are proving to be effective strategies for pushing performance higher.
+
+---
+
+## 12. Files & Checkpoints
+
+```
+checkpoints/
+├── cnn/                    # CNN model weights (5 folds)
+├── transformer/            # Transformer weights (5 folds)
+├── rocket/                 # Original ROCKET features
+├── rocket_lgbm_2k/         # ROCKET 2K + LGBM
+├── rocket_lgbm_5k/         # ROCKET 5K + LGBM
+├── rocket_domain_5k/       # ROCKET 5K + Domain features
+│   ├── train_features.npz  # Cached features (60,138 dims)
+│   ├── cv_summary.yaml     # Cross-validation results
+│   └── fold_*/             # Per-fold models
+└── rocket_domain_optuna/   # Optuna-tuned model (in progress)
+```
 
 ---
 
