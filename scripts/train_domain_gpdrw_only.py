@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """
-ROCKET + GP/DRW Features + LightGBM for MALLORN TDE Classification.
+Domain + GP/DRW Features Only (No ROCKET) for MALLORN TDE Classification.
 
-Adds generator-aware features exploiting how MALLORN was created:
-- GP Matern kernel for transient modeling
-- Damped Random Walk (DRW) for AGN variability
-- Likelihood ratio to discriminate AGN from TDEs
-
-Reference: MALLORN paper (arXiv:2512.04946)
+This model is intentionally simpler for stacking diversity:
+- Uses only domain features (~168 features) + GP/DRW features (~69 features)
+- No ROCKET features (faster, different error patterns)
+- Provides complementary predictions for ensemble stacking
 
 Usage:
-    python scripts/train_rocket_lgbm_gp_drw.py \
-        --load_features /path/to/train_features.npz \
-        --use_gp_drw_features
+    python scripts/train_domain_gpdrw_only.py \
+        --use_domain_features \
+        --use_gp_drw_features \
+        --checkpoint_dir checkpoints/no_rocket
 """
 
 import argparse
@@ -30,34 +29,18 @@ import yaml
 import warnings
 warnings.filterwarnings('ignore')
 
-try:
-    import optuna
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
-    OPTUNA_AVAILABLE = True
-except ImportError:
-    OPTUNA_AVAILABLE = False
-
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.data import load_train_data, load_test_data
-from src.features.rocket import MultiChannelROCKET
 from src.features.light_curve_features import extract_features_batch, get_feature_columns
 from src.features.drw_features import (
     extract_gp_drw_features_batch,
     get_gp_drw_feature_columns
 )
 
-BANDS = ['u', 'g', 'r', 'i', 'z', 'y']
-
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='ROCKET + GP/DRW + LightGBM')
-
-    # ROCKET parameters
-    parser.add_argument('--num_kernels', type=int, default=5000,
-                        help='Number of ROCKET kernels per band')
-    parser.add_argument('--grid_points', type=int, default=100,
-                        help='Number of time points in interpolated grid')
+    parser = argparse.ArgumentParser(description='Domain + GP/DRW Only (No ROCKET)')
 
     # Cross-validation
     parser.add_argument('--n_folds', type=int, default=5,
@@ -80,81 +63,18 @@ def parse_args():
                         help='Bands to use for GP/DRW fitting (comma-separated)')
 
     # Caching
-    parser.add_argument('--load_features', type=str, default=None,
-                        help='Load pre-computed ROCKET features')
     parser.add_argument('--load_gp_drw_features', type=str, default=None,
                         help='Load pre-computed GP/DRW features')
     parser.add_argument('--save_gp_drw_features', action='store_true',
                         help='Save GP/DRW features after extraction')
 
-    # Optuna hyperparameter tuning
-    parser.add_argument('--optuna', action='store_true',
-                        help='Run Optuna hyperparameter optimization')
-    parser.add_argument('--n_trials', type=int, default=50,
-                        help='Number of Optuna trials')
-
     # Output
-    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints/gp_drw',
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints/no_rocket',
                         help='Directory to save models')
-    parser.add_argument('--output', type=str, default='submission_gp_drw.csv',
+    parser.add_argument('--output', type=str, default='submission_no_rocket.csv',
                         help='Output submission file')
 
     return parser.parse_args()
-
-
-def interpolate_lightcurve(obj_lc: pd.DataFrame, n_points: int = 100) -> np.ndarray:
-    """Linear interpolation to regular grid."""
-    result = np.zeros((6, n_points))
-
-    all_times = obj_lc['Time (MJD)'].dropna()
-    if len(all_times) == 0:
-        return result
-
-    t_min, t_max = all_times.min(), all_times.max()
-    if t_max <= t_min:
-        return result
-
-    t_grid = np.linspace(t_min, t_max, n_points)
-
-    for i, band in enumerate(BANDS):
-        band_data = obj_lc[obj_lc['Filter'] == band].sort_values('Time (MJD)')
-        if len(band_data) < 2:
-            continue
-
-        t = band_data['Time (MJD)'].values
-        f = band_data['Flux'].values
-
-        valid = ~(np.isnan(t) | np.isnan(f))
-        t, f = t[valid], f[valid]
-
-        if len(t) < 2:
-            continue
-
-        f_scale = np.max(np.abs(f)) if np.max(np.abs(f)) > 0 else 1.0
-        f = f / f_scale
-
-        result[i] = np.interp(t_grid, t, f, left=0, right=0)
-
-    return result
-
-
-def prepare_interpolated_data(log_df: pd.DataFrame, lc_df: pd.DataFrame,
-                               n_points: int, desc: str = "Interpolating") -> np.ndarray:
-    """Prepare interpolated light curve data."""
-    n_samples = len(log_df)
-    X = np.zeros((n_samples, 6, n_points))
-
-    lc_groups = lc_df.groupby('object_id')
-
-    for idx, row in tqdm(log_df.iterrows(), total=n_samples, desc=desc):
-        obj_id = row['object_id']
-        try:
-            obj_lc = lc_groups.get_group(obj_id)
-        except KeyError:
-            continue
-        X[idx] = interpolate_lightcurve(obj_lc, n_points)
-
-    return X
 
 
 def extract_domain_features(log_df: pd.DataFrame, lc_df: pd.DataFrame,
@@ -179,7 +99,6 @@ def extract_gp_drw_features(log_df: pd.DataFrame, lc_df: pd.DataFrame,
     """Extract GP and DRW model features."""
     print(f"\n{desc}...")
     print(f"Fitting GP (Matern) and DRW models on bands: {bands}")
-    print("Note: This may take several minutes...")
 
     features_df = extract_gp_drw_features_batch(log_df, lc_df, bands=bands, verbose=True)
 
@@ -209,88 +128,6 @@ def find_optimal_threshold(y_true: np.ndarray, y_pred_proba: np.ndarray) -> tupl
     return best_threshold, best_f1
 
 
-def run_optuna_optimization(X: np.ndarray, y: np.ndarray,
-                            n_folds: int, n_trials: int, seed: int) -> dict:
-    """Run Optuna hyperparameter optimization with OOF-thresholded F1 objective.
-
-    Enhanced search space per next_steps_v3.md:
-    - min_child_samples: 20-150 (higher for robustness)
-    - feature_fraction, bagging_fraction: 0.5-0.9
-    - boosting_type: gbdt or dart
-    """
-    if not OPTUNA_AVAILABLE:
-        raise ImportError("Optuna not installed. Run: pip install optuna")
-
-    def objective(trial):
-        # Enhanced search space for v2 features
-        boosting_type = trial.suggest_categorical('boosting_type', ['gbdt', 'dart'])
-
-        params = {
-            'objective': 'binary',
-            'metric': 'binary_logloss',
-            'boosting_type': boosting_type,
-            'verbosity': -1,
-            'seed': seed,
-            'num_leaves': trial.suggest_int('num_leaves', 15, 127),
-            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
-            'feature_fraction': trial.suggest_float('feature_fraction', 0.5, 0.9),
-            'bagging_fraction': trial.suggest_float('bagging_fraction', 0.5, 0.9),
-            'bagging_freq': trial.suggest_int('bagging_freq', 1, 10),
-            'min_child_samples': trial.suggest_int('min_child_samples', 20, 150),
-            'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 10.0, log=True),
-            'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True),
-            'scale_pos_weight': trial.suggest_float('scale_pos_weight', 1.0, 50.0),
-        }
-
-        # DART-specific parameters
-        if boosting_type == 'dart':
-            params['drop_rate'] = trial.suggest_float('drop_rate', 0.05, 0.3)
-            params['skip_drop'] = trial.suggest_float('skip_drop', 0.3, 0.7)
-
-        skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
-
-        # Collect OOF predictions for pooled threshold selection
-        oof_preds = np.zeros(len(y))
-
-        for train_idx, val_idx in skf.split(X, y):
-            X_train, X_val = X[train_idx], X[val_idx]
-            y_train, y_val = y[train_idx], y[val_idx]
-
-            train_set = lgb.Dataset(X_train, y_train)
-            val_set = lgb.Dataset(X_val, y_val, reference=train_set)
-
-            model = lgb.train(
-                params, train_set,
-                num_boost_round=500,
-                valid_sets=[val_set],
-                callbacks=[lgb.early_stopping(30, verbose=False)],
-            )
-
-            oof_preds[val_idx] = model.predict(X_val)
-
-        # Pooled OOF threshold selection (as recommended in next_steps_v3.md)
-        _, best_f1 = find_optimal_threshold(y, oof_preds)
-        return best_f1
-
-    study = optuna.create_study(direction='maximize')
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
-
-    print(f"\nBest trial:")
-    print(f"  F1: {study.best_trial.value:.4f}")
-    print(f"  Params: {study.best_trial.params}")
-
-    # Build final params dict
-    best_params = {
-        'objective': 'binary',
-        'metric': 'binary_logloss',
-        'verbosity': -1,
-        'seed': seed,
-    }
-    best_params.update(study.best_trial.params)
-
-    return best_params
-
-
 def main():
     args = parse_args()
     np.random.seed(args.seed)
@@ -301,13 +138,12 @@ def main():
     gp_drw_bands = args.gp_drw_bands.split(',')
 
     print("=" * 70)
-    print("ROCKET + GP/DRW Features + LightGBM Training")
+    print("Domain + GP/DRW Features Only (No ROCKET)")
     print("=" * 70)
-    print(f"Kernels per band: {args.num_kernels}")
     print(f"Domain features: {args.use_domain_features}")
     print(f"GP/DRW features: {args.use_gp_drw_features}")
     print(f"GP/DRW bands: {gp_drw_bands}")
-    print(f"Optuna: {args.optuna}")
+    print("Note: This model is for stacking diversity (no ROCKET features)")
 
     # Load data
     print("\nLoading training data...")
@@ -316,32 +152,8 @@ def main():
     print(f"Loaded {len(train_log)} training objects")
     print(f"Class distribution: TDE={y.sum()}, non-TDE={len(y) - y.sum()}")
 
-    # Prepare ROCKET features
-    if args.load_features:
-        print(f"\nLoading pre-computed ROCKET features from {args.load_features}...")
-        cached = np.load(args.load_features)
-        X_rocket = cached['X_rocket']
-        print(f"Loaded ROCKET features shape: {X_rocket.shape}")
-    else:
-        print("\nInterpolating training light curves...")
-        X_interp = prepare_interpolated_data(
-            train_log, train_lc,
-            n_points=args.grid_points,
-            desc="Interpolating train"
-        )
-
-        print(f"\nFitting ROCKET with {args.num_kernels} kernels per band...")
-        rocket = MultiChannelROCKET(
-            num_kernels_per_channel=args.num_kernels,
-            seed=args.seed,
-        )
-        X_rocket = rocket.fit_transform(X_interp)
-        print(f"ROCKET features shape: {X_rocket.shape}")
-
-        joblib.dump(rocket, checkpoint_dir / 'rocket_transformer.pkl')
-
-    # Combine all feature sets
-    feature_sets = [X_rocket]
+    # Combine all feature sets (no ROCKET)
+    feature_sets = []
     all_feature_cols = []
 
     # Domain features
@@ -378,9 +190,13 @@ def main():
         feature_sets.append(X_gp_drw)
         all_feature_cols.extend(gp_drw_feature_cols)
 
+    if len(feature_sets) == 0:
+        raise ValueError("No features selected! Use --use_domain_features and/or --use_gp_drw_features")
+
     # Combine all features
     X_combined = np.hstack(feature_sets)
     print(f"\nCombined features shape: {X_combined.shape}")
+    print(f"Total features: {X_combined.shape[1]} (no ROCKET)")
 
     # Scale features
     scaler = StandardScaler()
@@ -388,36 +204,20 @@ def main():
 
     # LightGBM parameters
     pos_weight = (len(y) - y.sum()) / y.sum()
-
-    if args.optuna:
-        print(f"\n{'=' * 70}")
-        print(f"Running Optuna Hyperparameter Optimization ({args.n_trials} trials)")
-        print(f"{'=' * 70}")
-        params = run_optuna_optimization(
-            X_scaled, y,
-            n_folds=args.n_folds,
-            n_trials=args.n_trials,
-            seed=args.seed
-        )
-        # Save best params
-        with open(checkpoint_dir / 'optuna_best_params.yaml', 'w') as f:
-            yaml.dump(params, f)
-        print(f"\nBest params saved to {checkpoint_dir / 'optuna_best_params.yaml'}")
-    else:
-        params = {
-            'objective': 'binary',
-            'metric': 'binary_logloss',
-            'boosting_type': 'gbdt',
-            'num_leaves': 31,
-            'learning_rate': 0.05,
-            'feature_fraction': 0.8,
-            'bagging_fraction': 0.8,
-            'bagging_freq': 5,
-            'min_child_samples': 20,
-            'scale_pos_weight': pos_weight,
-            'verbosity': -1,
-            'seed': args.seed,
-        }
+    params = {
+        'objective': 'binary',
+        'metric': 'binary_logloss',
+        'boosting_type': 'gbdt',
+        'num_leaves': 31,
+        'learning_rate': 0.05,
+        'feature_fraction': 0.8,
+        'bagging_fraction': 0.8,
+        'bagging_freq': 5,
+        'min_child_samples': 20,
+        'scale_pos_weight': pos_weight,
+        'verbosity': -1,
+        'seed': args.seed,
+    }
 
     # Cross-validation
     skf = StratifiedKFold(n_splits=args.n_folds, shuffle=True, random_state=args.seed)
@@ -498,7 +298,6 @@ def main():
         'recall_mean': float(np.mean([r['recall'] for r in fold_results])),
         'roc_auc_mean': float(np.mean([r['roc_auc'] for r in fold_results])),
         'avg_threshold': float(avg_threshold),
-        'n_rocket_features': X_rocket.shape[1],
         'n_domain_features': len(domain_feature_cols) if domain_feature_cols else 0,
         'n_gp_drw_features': len(gp_drw_feature_cols) if gp_drw_feature_cols else 0,
         'n_total_features': X_combined.shape[1],
@@ -510,10 +309,9 @@ def main():
     print(f"ROC-AUC: {summary['roc_auc_mean']:.4f}")
     print(f"Average Threshold: {summary['avg_threshold']:.3f}")
     print(f"\nFeature breakdown:")
-    print(f"  ROCKET: {summary['n_rocket_features']}")
     print(f"  Domain: {summary['n_domain_features']}")
     print(f"  GP/DRW: {summary['n_gp_drw_features']}")
-    print(f"  Total: {summary['n_total_features']}")
+    print(f"  Total: {summary['n_total_features']} (no ROCKET)")
 
     # Save summary
     with open(checkpoint_dir / 'cv_summary.yaml', 'w') as f:
@@ -536,28 +334,20 @@ def main():
         optimal_threshold=avg_threshold,
     )
 
-    # Feature importance for GP/DRW features
-    if args.use_gp_drw_features and gp_drw_feature_cols:
-        print(f"\n{'=' * 70}")
-        print("GP/DRW Feature Importances")
-        print(f"{'=' * 70}")
+    # Feature importance
+    print(f"\n{'=' * 70}")
+    print("Top 20 Feature Importances")
+    print(f"{'=' * 70}")
 
-        importance = np.zeros(X_scaled.shape[1])
-        for model in models:
-            importance += model.feature_importance(importance_type='gain')
-        importance /= len(models)
+    importance = np.zeros(X_scaled.shape[1])
+    for model in models:
+        importance += model.feature_importance(importance_type='gain')
+    importance /= len(models)
 
-        # Find GP/DRW feature importance
-        n_rocket = X_rocket.shape[1]
-        n_domain = len(domain_feature_cols) if domain_feature_cols else 0
-        gp_drw_start = n_rocket + n_domain
-
-        gp_drw_importance = importance[gp_drw_start:]
-        sorted_idx = np.argsort(gp_drw_importance)[::-1]
-
-        for rank, idx in enumerate(sorted_idx[:10], 1):
-            if idx < len(gp_drw_feature_cols):
-                print(f"  {rank:2d}. {gp_drw_feature_cols[idx]}: {gp_drw_importance[idx]:.2f}")
+    sorted_idx = np.argsort(importance)[::-1]
+    for rank, idx in enumerate(sorted_idx[:20], 1):
+        if idx < len(all_feature_cols):
+            print(f"  {rank:2d}. {all_feature_cols[idx]}: {importance[idx]:.2f}")
 
     # Generate test predictions
     print(f"\n{'=' * 70}")
@@ -568,22 +358,8 @@ def main():
     test_log, test_lc = load_test_data()
     print(f"Loaded {len(test_log)} test objects")
 
-    print("\nInterpolating test light curves...")
-    X_test_interp = prepare_interpolated_data(
-        test_log, test_lc,
-        n_points=args.grid_points,
-        desc="Interpolating test"
-    )
-
-    # Load ROCKET transformer
-    if args.load_features:
-        rocket = joblib.load(Path(args.load_features).parent / 'rocket_transformer.pkl')
-
-    print("Applying ROCKET transform...")
-    X_test_rocket = rocket.transform(X_test_interp)
-
     # Combine test features
-    test_feature_sets = [X_test_rocket]
+    test_feature_sets = []
 
     if args.use_domain_features:
         X_test_domain, _ = extract_domain_features(
@@ -621,6 +397,14 @@ def main():
 
     submission.to_csv(args.output, index=False)
     print(f"\nSubmission saved to: {args.output}")
+
+    # Save probabilities for stacking
+    probs_path = args.output.replace('.csv', '_probs.csv')
+    pd.DataFrame({
+        'object_id': test_log['object_id'],
+        'probability': test_preds_proba,
+    }).to_csv(probs_path, index=False)
+    print(f"Probabilities saved to: {probs_path}")
 
     # Save test predictions for ensemble
     np.savez_compressed(

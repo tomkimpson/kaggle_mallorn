@@ -167,8 +167,10 @@ def extract_per_band_features(
         feature_names = [
             'peak_flux', 'peak_time', 'mean_flux', 'std_flux', 'median_flux',
             'skewness', 'kurtosis', 'rise_time', 'decay_rate', 'amplitude_ratio',
-            'duration', 'above_baseline_frac', 'snr_mean', 'snr_max',
-            # New power-law features
+            'duration', 'above_baseline_frac', 'snr_mean', 'snr_max', 'snr_median',
+            # Fit reliability features
+            'n_obs', 'has_enough_points', 'median_dt', 'max_gap',
+            # Power-law features
             'decay_chi2', 'decay_alpha_dev',
             # Smoothness features
             'n_inflection_points', 'max_acceleration', 'monotonic_ratio', 'roughness',
@@ -231,6 +233,20 @@ def extract_per_band_features(
     snr = flux / (flux_err + 1e-8)
     features[prefix + 'snr_mean'] = np.mean(snr)
     features[prefix + 'snr_max'] = np.max(snr)
+    features[prefix + 'snr_median'] = np.median(snr)
+
+    # Fit reliability / data quality features
+    features[prefix + 'n_obs'] = float(len(flux))
+    features[prefix + 'has_enough_points'] = 1.0 if len(flux) >= 15 else 0.0
+
+    # Temporal cadence features
+    if len(time) >= 2:
+        dt = np.diff(time)
+        features[prefix + 'median_dt'] = np.median(dt)
+        features[prefix + 'max_gap'] = np.max(dt)
+    else:
+        features[prefix + 'median_dt'] = 0.0
+        features[prefix + 'max_gap'] = 0.0
 
     # Smoothness features (TDEs are smooth, SNe have bumps)
     smoothness = compute_smoothness_features(flux, time)
@@ -557,8 +573,10 @@ def get_feature_columns(include_gp: bool = False, include_fats: bool = False) ->
     per_band_features = [
         'peak_flux', 'peak_time', 'mean_flux', 'std_flux', 'median_flux',
         'skewness', 'kurtosis', 'rise_time', 'decay_rate', 'amplitude_ratio',
-        'duration', 'above_baseline_frac', 'snr_mean', 'snr_max',
-        # New power-law features
+        'duration', 'above_baseline_frac', 'snr_mean', 'snr_max', 'snr_median',
+        # Fit reliability features
+        'n_obs', 'has_enough_points', 'median_dt', 'max_gap',
+        # Power-law features
         'decay_chi2', 'decay_alpha_dev',
         # Smoothness features
         'n_inflection_points', 'max_acceleration', 'monotonic_ratio', 'roughness',

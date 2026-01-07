@@ -205,7 +205,10 @@ def extract_gp_drw_features_single(time: np.ndarray, flux: np.ndarray,
     # Default values for insufficient data
     default_keys = ['drw_tau', 'drw_sigma', 'drw_SF_inf', 'drw_log_likelihood',
                     'gp_matern_length_scale', 'gp_matern_amplitude', 'gp_log_likelihood',
-                    'likelihood_ratio_drw_vs_gp']
+                    'likelihood_ratio_drw_vs_gp',
+                    # Normalized likelihood features
+                    'drw_ll_per_point', 'gp_ll_per_point', 'lr_per_point',
+                    'delta_aic_drw_minus_gp']
 
     if len(time) < 10:
         for key in default_keys:
@@ -243,7 +246,106 @@ def extract_gp_drw_features_single(time: np.ndarray, flux: np.ndarray,
     else:
         features[prefix + 'likelihood_ratio_drw_vs_gp'] = 0.0
 
+    # Normalized likelihood features (per-point, stabilizes across different LC lengths)
+    n_obs = len(time)  # Number of observations used in fitting
+    k_drw = 2  # DRW parameters: tau, sigma
+    k_gp = 3   # GP parameters: length_scale, amplitude, noise
+
+    if n_obs > 0 and np.isfinite(drw.log_likelihood_):
+        features[prefix + 'drw_ll_per_point'] = drw.log_likelihood_ / n_obs
+    else:
+        features[prefix + 'drw_ll_per_point'] = 0.0
+
+    if n_obs > 0 and np.isfinite(gp.log_likelihood_):
+        features[prefix + 'gp_ll_per_point'] = gp.log_likelihood_ / n_obs
+    else:
+        features[prefix + 'gp_ll_per_point'] = 0.0
+
+    if n_obs > 0 and np.isfinite(drw.log_likelihood_) and np.isfinite(gp.log_likelihood_):
+        features[prefix + 'lr_per_point'] = (drw.log_likelihood_ - gp.log_likelihood_) / n_obs
+    else:
+        features[prefix + 'lr_per_point'] = 0.0
+
+    # AIC-style comparison (negative delta_aic means DRW preferred)
+    if np.isfinite(drw.log_likelihood_) and np.isfinite(gp.log_likelihood_):
+        aic_drw = 2 * k_drw - 2 * drw.log_likelihood_
+        aic_gp = 2 * k_gp - 2 * gp.log_likelihood_
+        features[prefix + 'delta_aic_drw_minus_gp'] = aic_drw - aic_gp
+    else:
+        features[prefix + 'delta_aic_drw_minus_gp'] = 0.0
+
     return features
+
+
+def compute_gp_drw_cross_band_features(obj_features: dict, bands: list = ['g', 'r', 'i']) -> dict:
+    """
+    Compute cross-band consistency features from per-band GP/DRW fits.
+
+    These features encode "achromatic DRW" vs "chromatic transient" behavior.
+    AGN should have consistent parameters across bands.
+
+    Args:
+        obj_features: Dictionary containing per-band features (e.g., 'g_drw_tau', etc.)
+        bands: List of bands to aggregate
+
+    Returns:
+        Dictionary of cross-band features
+    """
+    cross_features = {}
+
+    # Helper to get per-band values, converting 0.0 (our default for missing) to NaN
+    def get_band_values(feature_name):
+        values = []
+        for band in bands:
+            key = f'{band}_{feature_name}'
+            val = obj_features.get(key, 0.0)
+            # Treat 0.0 as missing for parameters that should never be exactly 0
+            if val == 0.0 and feature_name in ['drw_tau', 'drw_sigma', 'drw_SF_inf',
+                                                 'gp_matern_length_scale', 'gp_matern_amplitude']:
+                val = np.nan
+            values.append(val)
+        return np.array(values)
+
+    # Timescale consistency (AGN have consistent tau across bands)
+    tau_values = get_band_values('drw_tau')
+    tau_mean = np.nanmean(tau_values)
+    tau_std = np.nanstd(tau_values)
+    cross_features['tau_mean_across_bands'] = tau_mean if np.isfinite(tau_mean) else 0.0
+    cross_features['tau_std_across_bands'] = tau_std if np.isfinite(tau_std) else 0.0
+    cross_features['tau_cv_across_bands'] = tau_std / (tau_mean + 1e-8) if np.isfinite(tau_mean) and np.isfinite(tau_std) else 0.0
+
+    # Amplitude consistency
+    sigma_values = get_band_values('drw_sigma')
+    sigma_mean = np.nanmean(sigma_values)
+    sigma_std = np.nanstd(sigma_values)
+    cross_features['sigma_cv_across_bands'] = sigma_std / (sigma_mean + 1e-8) if np.isfinite(sigma_mean) and np.isfinite(sigma_std) else 0.0
+
+    # Structure function infinity consistency
+    sf_values = get_band_values('drw_SF_inf')
+    sf_mean = np.nanmean(sf_values)
+    sf_std = np.nanstd(sf_values)
+    cross_features['sf_inf_cv_across_bands'] = sf_std / (sf_mean + 1e-8) if np.isfinite(sf_mean) and np.isfinite(sf_std) else 0.0
+
+    # Likelihood ratio consistency (model preference should agree across bands)
+    lr_values = np.array([obj_features.get(f'{band}_likelihood_ratio_drw_vs_gp', 0.0) for band in bands])
+    cross_features['lr_mean'] = np.nanmean(lr_values)
+    cross_features['lr_std'] = np.nanstd(lr_values)
+    cross_features['lr_max'] = np.nanmax(lr_values)
+    # Fraction of bands where DRW is preferred (LR > 0)
+    cross_features['lr_sign_agreement'] = np.sum(lr_values > 0) / len(bands)
+
+    # Combined vs per-band disagreement features
+    combined_tau = obj_features.get('combined_drw_tau', 0.0)
+    if combined_tau == 0.0:
+        combined_tau = np.nan
+    cross_features['delta_tau_combined_minus_mean'] = (combined_tau - tau_mean) if np.isfinite(combined_tau) and np.isfinite(tau_mean) else 0.0
+
+    combined_lr = obj_features.get('combined_likelihood_ratio_drw_vs_gp', 0.0)
+    lr_mean_val = cross_features['lr_mean']
+    cross_features['abs_delta_lr_combined_minus_lr_mean'] = abs(combined_lr - lr_mean_val) if np.isfinite(lr_mean_val) else 0.0
+    cross_features['combined_prefers_drw'] = 1.0 if combined_lr > 0 else 0.0
+
+    return cross_features
 
 
 def extract_gp_drw_features_batch(log_df: pd.DataFrame, lc_df: pd.DataFrame,
@@ -303,6 +405,33 @@ def extract_gp_drw_features_batch(log_df: pd.DataFrame, lc_df: pd.DataFrame,
             )
         obj_features.update(combined_features)
 
+        # Compute cross-band consistency features
+        cross_band_features = compute_gp_drw_cross_band_features(obj_features, bands=bands)
+        obj_features.update(cross_band_features)
+
+        # Add rest-frame time features using redshift
+        z = row.get('Z', 0.0)
+        if z is None or not np.isfinite(z):
+            z = 0.0
+        rest_factor = 1 + z
+
+        # Global redshift feature
+        obj_features['log1p_z'] = np.log1p(z)
+
+        # Rest-frame timescale features for each band
+        for band in bands:
+            tau_obs = obj_features.get(f'{band}_drw_tau', 0.0)
+            length_scale_obs = obj_features.get(f'{band}_gp_matern_length_scale', 0.0)
+
+            obj_features[f'{band}_tau_rest'] = tau_obs / rest_factor if tau_obs > 0 else 0.0
+            obj_features[f'{band}_gp_length_scale_rest'] = length_scale_obs / rest_factor if length_scale_obs > 0 else 0.0
+
+        # Rest-frame for combined fit
+        combined_tau = obj_features.get('combined_drw_tau', 0.0)
+        combined_ls = obj_features.get('combined_gp_matern_length_scale', 0.0)
+        obj_features['combined_tau_rest'] = combined_tau / rest_factor if combined_tau > 0 else 0.0
+        obj_features['combined_gp_length_scale_rest'] = combined_ls / rest_factor if combined_ls > 0 else 0.0
+
         all_features.append(obj_features)
 
         if verbose and (idx + 1) % 100 == 0:
@@ -316,7 +445,10 @@ def get_gp_drw_feature_columns(bands: list = ['g', 'r', 'i']) -> list:
     base_features = [
         'drw_tau', 'drw_sigma', 'drw_SF_inf', 'drw_log_likelihood',
         'gp_matern_length_scale', 'gp_matern_amplitude', 'gp_log_likelihood',
-        'likelihood_ratio_drw_vs_gp'
+        'likelihood_ratio_drw_vs_gp',
+        # Normalized likelihood features
+        'drw_ll_per_point', 'gp_ll_per_point', 'lr_per_point',
+        'delta_aic_drw_minus_gp',
     ]
 
     columns = []
@@ -327,5 +459,27 @@ def get_gp_drw_feature_columns(bands: list = ['g', 'r', 'i']) -> list:
     # Combined features
     for feat in base_features:
         columns.append(f'combined_{feat}')
+
+    # Cross-band consistency features
+    cross_band_features = [
+        'tau_mean_across_bands', 'tau_std_across_bands', 'tau_cv_across_bands',
+        'sigma_cv_across_bands', 'sf_inf_cv_across_bands',
+        'lr_mean', 'lr_std', 'lr_max', 'lr_sign_agreement',
+        'delta_tau_combined_minus_mean', 'abs_delta_lr_combined_minus_lr_mean',
+        'combined_prefers_drw',
+    ]
+    columns.extend(cross_band_features)
+
+    # Rest-frame time features (per-band)
+    for band in bands:
+        columns.append(f'{band}_tau_rest')
+        columns.append(f'{band}_gp_length_scale_rest')
+
+    # Combined rest-frame features
+    columns.append('combined_tau_rest')
+    columns.append('combined_gp_length_scale_rest')
+
+    # Global redshift feature
+    columns.append('log1p_z')
 
     return columns
