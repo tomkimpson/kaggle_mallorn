@@ -1,6 +1,6 @@
 # MALLORN TDE Classification - Project Status
 
-**Date:** 2026-01-07
+**Date:** 2026-01-08 (Updated)
 **Current Best Score:** 0.6117 (Public LB)
 **Competition:** [MALLORN Astronomical Classification Challenge](https://www.kaggle.com/competitions/mallorn-astronomical-classification-challenge)
 
@@ -146,10 +146,11 @@ Combined gp_drw_v2 + no_rocket with LogisticRegressionCV:
 - Weights: no_rocket (0.19) > gp_drw_v2 (0.13)
 - **Status:** Kaggle submission hit rate limit, not yet tested on LB
 
-### MultiROCKET (Still Running)
+### MultiROCKET (Abandoned)
 Job 8177804 testing MultiROCKET variant with multivariate kernels.
-- Running for 11+ hours
-- May not be valuable given no-ROCKET model's success
+- **Result:** TIMED OUT after 12 hours - didn't even complete feature extraction
+- sktime failed to import, fell back to slow custom implementation
+- **Decision:** Not pursuing ROCKET-based approaches further given no-ROCKET model's superior performance
 
 ---
 
@@ -174,6 +175,8 @@ Job 8177804 testing MultiROCKET variant with multivariate kernels.
 
 ### High Priority
 1. **Optuna on no-ROCKET model** - Tune hyperparameters for the best model
+   - Create `slurm/train_optuna_no_rocket.sh` (faster than ROCKET version)
+   - Search space: num_leaves, learning_rate, regularization, etc.
 2. **Re-run stacker submission** - Rate limit should reset
 3. **Feature ablation** - Which GP/DRW features matter most?
 
@@ -183,8 +186,12 @@ Job 8177804 testing MultiROCKET variant with multivariate kernels.
 6. **Stratify by data quality** - Split by n_obs or time_span buckets
 
 ### Lower Priority
-7. **Cancel/monitor multirocket** - Likely not needed now
-8. **Try XGBoost/CatBoost** - Alternative gradient boosting
+7. **Try XGBoost/CatBoost** - Alternative gradient boosting (but LightGBM working well)
+
+### Not Pursuing
+- ~~ROCKET features~~ - Confirmed to hurt performance
+- ~~MultiROCKET~~ - Too slow, not beneficial
+- ~~Neural networks~~ - Failed badly on this problem
 
 ---
 
@@ -199,14 +206,17 @@ kaggle competitions submit -c mallorn-astronomical-classification-challenge \
 
 ---
 
-## Running Jobs
+## Job History
 
-As of 2026-01-07 21:00 AEDT:
-- **8177804** (multirocket) - Still running on john18 (~12 hours)
+All jobs completed as of 2026-01-08:
 
-Completed:
-- **8183409** (optuna_gp_drw) - TIMED OUT after 6 hours
-- **8183410** (no_rocket) - COMPLETED, produced best result
+| Job ID | Name | Duration | Status | Outcome |
+|--------|------|----------|--------|---------|
+| 8183410 | no_rocket | 2h 57m | COMPLETED | **Best model: LB 0.6117** |
+| 8183409 | optuna_gp_drw | 6h | TIMEOUT | Feature extraction too slow |
+| 8177804 | multirocket | 12h | TIMEOUT | Never finished interpolation |
+
+**Conclusion:** ROCKET-based approaches are not worth pursuing. Focus on domain + GP/DRW features.
 
 ---
 
